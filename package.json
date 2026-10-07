@@ -19,6 +19,7 @@
     "express": "^4.21.2",
     "flag-icons": "^7.5.0",
     "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
     "socket.io": "^4.8.1",
     "world-countries": "^5.1.0"
   },

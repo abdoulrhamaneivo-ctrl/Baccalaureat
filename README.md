@@ -64,7 +64,7 @@ Ouvrir **http://localhost:3000**. Pour jouer sur plusieurs appareils du même r�
 
 ## Déploiement Vercel
 
-Le projet sert les fichiers du jeu comme site statique et utilise une Vercel Function pour Socket.IO. L’intégration Upstash Redis conserve les salles et partage les événements entre instances. Les identifiants sont fournis au projet Vercel par l’intégration, via `KV_URL`; ils ne doivent pas être copiés dans le dépôt.
+Le site statique est hébergé sur Vercel. Socket.IO se connecte au serveur Render configuré par `PETIT_BAC_SOCKET_URL`. Upstash Redis conserve les salles en cours; Neon stocke les parties terminées, les classements et les mots validés. Les URL Redis et PostgreSQL restent des variables secrètes et ne doivent pas être copiées dans le dépôt.
 
 Depuis le compte Vercel lié au projet :
 
@@ -74,17 +74,15 @@ npm run build
 vercel --prod
 ```
 
-Le client utilise le transport WebSocket et reprend la session après une reconnexion. Les connexions Vercel Hobby sont limitées à cinq minutes; une partie en cours peut donc se reconnecter automatiquement. Les salles sont conservées dans Redis pendant 24 heures lorsqu’un joueur est connecté, puis dix minutes après la déconnexion de tous les joueurs.
+Le client utilise le transport WebSocket et reprend la session après une reconnexion. Les salles sont conservées dans Redis pendant 24 heures lorsqu’un joueur est connecté, puis dix minutes après la déconnexion de tous les joueurs.
 
-L’intégration Redis est configurée sur le forfait gratuit. Elle partage les salles avec toutes les instances Vercel; le répartiteur Socket.IO Redis diffuse les changements aux joueurs connectés sur d’autres instances.
+## Temps réel et persistance
 
-## Séparer le site et le serveur temps réel
+Le serveur temps réel tourne sur le Web Service Render `petit-bac-temps-reel`, avec `npm ci` comme commande de build, `npm run start:render` comme commande de démarrage et `/health` comme chemin de vérification. Render utilise `KV_URL` pour les salles et `DATABASE_URL` pour Neon. Vercel utilise `PETIT_BAC_SOCKET_URL` avec l’origine Render, par exemple `https://petit-bac-temps-reel.onrender.com`.
 
-Le site statique reste sur Vercel. Le serveur temps réel peut tourner sur un Web Service Render avec `npm ci` comme commande de build, `npm run start:render` comme commande de démarrage et `/health` comme chemin de vérification. Définissez `KV_URL` avec l’URL de la même base Upstash, puis ajoutez `PETIT_BAC_SOCKET_URL` aux variables de build Vercel avec l’origine Render, par exemple `https://petit-bac-temps-reel.onrender.com`, et redéployez le site.
+Sur Render, les clics et les saisies sont traités par le processus Node actif. Les salles restent en mémoire pendant le jeu et sont sauvegardées dans Redis en arrière-plan toutes les cinq secondes pour permettre une reprise après un redémarrage. Gardez une seule instance Render : l’état actif des salles est local au processus.
 
-Sur Render, les clics et les saisies sont traités par le processus Node actif; ils n’attendent pas le verrou Redis utilisé par la version Vercel. Les salles restent en mémoire pendant le jeu et sont sauvegardées en arrière-plan toutes les cinq secondes pour permettre une reprise après un redémarrage. Gardez une seule instance Render : l’état des salles est local au processus. L’extension à plusieurs instances demande un répartiteur d’état partagé.
-
-Le forfait gratuit Render met les services en veille après une période sans activité, ce qui ajoute un délai au premier joueur qui revient. Pour une réponse rapide à toute heure, il faut un service toujours actif. Cette configuration Render est préparée dans le dépôt, mais aucun service Render n’a été créé ni facturé.
+Les écritures de scores et les lectures d’historique passent par Neon; elles sont séparées du traitement temps réel des réponses et des minuteurs. Le démarrage du serveur importe aussi les anciens classements Upstash vers Neon une seule fois.
 
 ## Vérifications
 
@@ -110,6 +108,7 @@ Pour vérifier l’interface complète, ouvrir le serveur sur deux navigateurs o
 | `dist/style.css` | Présentation du mode Solo et styles communs |
 | `dist/multiplayer.css` | Accueil des modes et interface multijoueur responsive |
 | `dist/capitals.js` et `dist/capitals.css` | Quiz solo des drapeaux et styles du mini-jeu |
+| `dist/culture-data.js`, `dist/culture.js` et `dist/culture.css` | Questions et interface du quiz de culture générale |
 | `dist/world-data.js` et `dist/flags/` | Données locales des pays, capitales et drapeaux |
 | `dist/app.js` | Mode Solo existant et choix du mode à l’accueil |
 | `dist/multiplayer.js` | Interface multijoueur, Socket.IO et reconnexion |

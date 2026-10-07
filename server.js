@@ -11,15 +11,19 @@ const {
   LETTERS,
   DEFAULT_CONFIG,
   DEFAULT_CAPITALS_CONFIG,
+  DEFAULT_CULTURE_CONFIG,
   validateConfig,
   validateCapitalsConfig,
+  validateCultureConfig,
   validatePlayerName,
   validateAnswer,
   calculateRoundScores,
   calculateCapitalsScores,
+  calculateCultureScores,
   isCapitalsAnswerCorrect,
   WORLD_COUNTRIES,
   CAPITALS_CONTINENTS,
+  CULTURE_QUESTIONS,
 } = require('./server/game-rules.js');
 const { createStatsStore } = require('./server/stats-store.js');
 
@@ -44,7 +48,7 @@ function createGameServer(options = {}) {
   const roomRedis = checkpointRedis || redis;
   const port = options.port ?? Number(process.env.PORT || 3000);
   const now = options.now || Date.now;
-  const stats = createStatsStore(options.statsRedis || redis, { now });
+  const stats = options.statsStore || createStatsStore(options.statsRedis !== undefined ? options.statsRedis : redis, { now, pool: options.statsPool });
   const scheduleTimer = options.setTimeout || setTimeout;
   const cancelTimer = options.clearTimeout || clearTimeout;
   let closing = false;
@@ -76,7 +80,7 @@ function createGameServer(options = {}) {
       roundsPlayed: room.history.length,
       players: room.players.map((player) => ({ pseudo: player.name, score: player.score })),
     };
-    const persist = () => stats.recordMatch(match).catch(logTimerError);
+    const persist = () => { void stats.recordMatch(match).catch(logTimerError); };
     const context = transactions.getStore();
     if (context) context.afterCommit.push(persist);
     else void persist();
@@ -171,14 +175,15 @@ function createGameServer(options = {}) {
       for (let index = 0; index < pageKeys.length; index += 1) {
         try {
           const room = typeof values[index] === 'string' ? JSON.parse(values[index]) : values[index];
-          if (!room || !Array.isArray(room.players) || !['petit-bac', 'capitales'].includes(room.gameType)) continue;
+          if (!room || !Array.isArray(room.players) || !['petit-bac', 'capitales', 'culture'].includes(room.gameType)) continue;
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
           room.currentVotes ||= Object.create(null);
           room.pendingAcceptedWords ||= [];
+          room.usedQuestions ||= [];
           for (const player of room.players) {
-            const answerCount = room.gameType === 'capitales' ? 1 : room.config.categories.length;
+            const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
             room.currentAnswers[player.id] ||= Array(answerCount).fill('');
             room.currentAnswerRevisions[player.id] ||= Array(answerCount).fill(0);
             room.currentApprovals[player.id] ||= Array(answerCount).fill(false);
@@ -216,7 +221,7 @@ function createGameServer(options = {}) {
           room.currentApprovals ||= Object.create(null);
           room.currentVotes ||= Object.create(null);
           for (const player of room.players) {
-            const answerCount = room.gameType === 'capitales' ? 1 : room.config.categories.length;
+            const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
             room.currentAnswers[player.id] ||= Array(answerCount).fill('');
             room.currentAnswerRevisions[player.id] ||= Array(answerCount).fill(0);
             room.currentApprovals[player.id] ||= Array(answerCount).fill(false);
@@ -231,9 +236,6 @@ function createGameServer(options = {}) {
       }
       const context = { ...metadata, changedRooms: new Set(), persistRooms: new Set(), acknowledgements: [], afterCommit: [] };
       const roomBeforeOperation = code === null ? null : rooms.get(code);
-      if (roomBeforeOperation?.state === 'playing' && roomBeforeOperation.roundEndsAt && roomBeforeOperation.roundEndsAt <= now()) {
-        await refreshAcceptedWords();
-      }
       await transactions.run(context, () => {
         if (code !== null) {
           const room = rooms.get(code);
@@ -261,6 +263,8 @@ function createGameServer(options = {}) {
     if (error) console.error('Erreur de minuterie de salle :', error.message);
   };
   void refreshAcceptedWords().catch(logTimerError);
+  const dictionaryRefreshTimer = setInterval(() => { void refreshAcceptedWords().catch(logTimerError); }, 15_000);
+  dictionaryRefreshTimer.unref?.();
   const runTimer = (operation) => {
     try {
       const result = operation();
@@ -293,8 +297,10 @@ function createGameServer(options = {}) {
       players: [host],
       state: 'lobby',
       config: gameType === 'capitales'
-        ? { ...DEFAULT_CAPITALS_CONFIG }
-        : { ...DEFAULT_CONFIG, categories: [...DEFAULT_CONFIG.categories] },
+        ? { ...DEFAULT_CAPITALS_CONFIG, continents: [...DEFAULT_CAPITALS_CONFIG.continents] }
+        : gameType === 'culture'
+          ? { ...DEFAULT_CULTURE_CONFIG, categories: [...DEFAULT_CULTURE_CONFIG.categories] }
+          : { ...DEFAULT_CONFIG, categories: [...DEFAULT_CONFIG.categories] },
       roundNumber: 0,
       letter: null,
       roundStartedAt: null,
@@ -303,6 +309,7 @@ function createGameServer(options = {}) {
       breakEndsAt: null,
       usedLetters: [],
       usedCountries: [],
+      usedQuestions: [],
       question: null,
       currentAnswers: Object.create(null),
       currentAnswerRevisions: Object.create(null),
@@ -336,7 +343,7 @@ function createGameServer(options = {}) {
       roundEndsAt: room.roundEndsAt,
       correctionEndsAt: room.correctionEndsAt,
       breakEndsAt: room.breakEndsAt,
-      reviewSeconds: room.gameType === 'capitales' ? CAPITALS_REVIEW_SECONDS : REVIEW_SECONDS,
+      reviewSeconds: room.gameType === 'petit-bac' ? REVIEW_SECONDS : CAPITALS_REVIEW_SECONDS,
       categories: room.config.categories,
       myPlayerId: viewer?.id || null,
     };
@@ -352,15 +359,26 @@ function createGameServer(options = {}) {
         result.question.answer = room.question.kind === 'country' ? room.question.country.name : room.question.country.capital;
       }
     }
+    if (room.gameType === 'culture' && room.question) {
+      result.question = {
+        category: room.question.category,
+        prompt: room.question.prompt,
+        options: [...room.question.options],
+      };
+      if (['correction', 'finished'].includes(room.state)) {
+        result.question.answerIndex = room.question.answer;
+        result.question.answer = room.question.options[room.question.answer];
+      }
+    }
     if (room.state === 'playing' && viewer) {
       result.myAnswers = [...(room.currentAnswers[viewer.id] || [])];
       result.myAnswerRevisions = [...(room.currentAnswerRevisions[viewer.id] || [])];
     }
-    if (['correction', 'finished'].includes(room.state) && room.currentScores && room.gameType === 'capitales') {
+    if (['correction', 'finished'].includes(room.state) && room.currentScores && ['capitales', 'culture'].includes(room.gameType)) {
       result.roundResults = room.players.map((player) => ({
         playerId: player.id,
         name: player.name,
-        answers: [{ category: room.question.kind === 'country' ? 'Pays' : 'Capitale', ...(room.currentScores[player.id]?.answers[0] || { word: '', correct: false, points: 0, reason: 'Réponse vide' }), canApprove: false }],
+        answers: [{ category: room.gameType === 'capitales' ? (room.question.kind === 'country' ? 'Pays' : 'Capitale') : room.question.category, ...(room.currentScores[player.id]?.answers[0] || { word: '', correct: false, points: 0, reason: 'Réponse vide' }), canApprove: false }],
         roundScore: room.currentScores[player.id]?.total || 0,
       }));
     } else if (['correction', 'finished'].includes(room.state) && room.currentScores) {
@@ -463,9 +481,25 @@ function createGameServer(options = {}) {
     const kind = questionMode === 'random' ? (crypto.randomInt(2) === 0 ? 'country' : 'capital') : questionMode;
     return { kind, country };
   };
+  const pickCultureQuestion = (room) => {
+    const allowed = new Set(room.config.categories);
+    const pool = CULTURE_QUESTIONS.filter((question) => allowed.has(question.category));
+    let unused = pool.filter((question) => !room.usedQuestions.includes(question.id));
+    if (!unused.length) {
+      const previous = room.usedQuestions.at(-1);
+      room.usedQuestions = [];
+      unused = pool.filter((question) => question.id !== previous);
+    }
+    const choices = unused.length ? unused : pool;
+    const question = choices[crypto.randomInt(choices.length)];
+    room.usedQuestions.push(question.id);
+    return question;
+  };
   const scoreCurrentRound = (room) => room.gameType === 'capitales'
     ? calculateCapitalsScores(room.players, room.currentAnswers, room.question)
-    : calculateRoundScores(room.players, room.currentAnswers, room.currentApprovals, room.config.categories, room.letter);
+    : room.gameType === 'culture'
+      ? calculateCultureScores(room.players, room.currentAnswers, room.question)
+      : calculateRoundScores(room.players, room.currentAnswers, room.currentApprovals, room.config.categories, room.letter);
   const refreshCorrectionScores = (room) => {
     for (const player of room.players) {
       const answers = room.currentApprovals[player.id] || (room.currentApprovals[player.id] = []);
@@ -493,6 +527,9 @@ function createGameServer(options = {}) {
     if (room.gameType === 'capitales') {
       room.letter = null;
       room.question = pickQuestion(room);
+    } else if (room.gameType === 'culture') {
+      room.letter = null;
+      room.question = pickCultureQuestion(room);
     } else {
       room.letter = pickLetter(room, room.roundNumber === 1);
       room.usedLetters.push(room.letter);
@@ -509,7 +546,7 @@ function createGameServer(options = {}) {
     room.currentVotes = Object.create(null);
     room.currentScores = null;
     for (const player of room.players) {
-      const answerCount = room.gameType === 'capitales' ? 1 : room.config.categories.length;
+      const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
       room.currentAnswers[player.id] = Array(answerCount).fill('');
       room.currentAnswerRevisions[player.id] = Array(answerCount).fill(0);
       room.currentApprovals[player.id] = Array(answerCount).fill(false);
@@ -534,7 +571,7 @@ function createGameServer(options = {}) {
     for (const player of room.players) player.score += room.currentScores[player.id]?.total || 0;
     room.history.push({ number: room.roundNumber, letter: room.letter, scores: room.currentScores });
     room.state = 'correction';
-    const reviewSeconds = room.gameType === 'capitales' ? CAPITALS_REVIEW_SECONDS : REVIEW_SECONDS;
+    const reviewSeconds = room.gameType === 'petit-bac' ? REVIEW_SECONDS : CAPITALS_REVIEW_SECONDS;
     room.correctionEndsAt = now() + reviewSeconds * 1000;
     room.roundEndsAt = null;
     room.timers.review = scheduleTimer(() => runTimer(() => advanceAfterCorrection(room.code, room.roundNumber)), reviewSeconds * 1000);
@@ -646,7 +683,7 @@ function createGameServer(options = {}) {
       const checkedName = validatePlayerName(payload.name);
       if (checkedName.error) return ack?.({ ok: false, error: checkedName.error });
       const gameType = payload.gameType || 'petit-bac';
-      if (!['petit-bac', 'capitales'].includes(gameType)) return ack?.({ ok: false, error: 'Choix du jeu invalide.' });
+      if (!['petit-bac', 'capitales', 'culture'].includes(gameType)) return ack?.({ ok: false, error: 'Choix du jeu invalide.' });
       const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id, gameType };
       const room = makeRoom(player);
       socket.data.roomCode = room.code;
@@ -665,7 +702,7 @@ function createGameServer(options = {}) {
       if (room.players.some((player) => normalize(player.name) === normalize(checkedName.value))) return ack?.({ ok: false, error: 'Ce pseudo est déjà utilisé dans la salle.' });
       const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id };
       room.players.push(player);
-      const answerCount = room.gameType === 'capitales' ? 1 : room.config.categories.length;
+      const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
       room.currentAnswers[player.id] = Array(answerCount).fill('');
       room.currentAnswerRevisions[player.id] = Array(answerCount).fill(0);
       room.currentApprovals[player.id] = Array(answerCount).fill(false);
@@ -700,7 +737,7 @@ function createGameServer(options = {}) {
       const { room } = linked;
       if (!hostOnly(socket, room, ack)) return;
       if (room.state !== 'lobby') return ack?.({ ok: false, error: 'La configuration est verrouillée après le démarrage.' });
-      const checked = room.gameType === 'capitales' ? validateCapitalsConfig(payload.config) : validateConfig(payload.config);
+      const checked = room.gameType === 'capitales' ? validateCapitalsConfig(payload.config) : room.gameType === 'culture' ? validateCultureConfig(payload.config) : validateConfig(payload.config);
       if (checked.error) return ack?.({ ok: false, error: checked.error });
       room.config = checked.value;
       ackSuccess(ack, room, linked.player);
@@ -719,6 +756,7 @@ function createGameServer(options = {}) {
       room.gameStartedAt = now();
       room.usedLetters = [];
       room.usedCountries = [];
+      room.usedQuestions = [];
       room.history = [];
       for (const player of room.players) player.score = 0;
       ack?.({ ok: true });
@@ -735,7 +773,7 @@ function createGameServer(options = {}) {
         endRound(room.code, room.roundNumber);
         return ack?.({ ok: false, error: 'Le temps est écoulé ; les réponses sont verrouillées.' });
       }
-      const answerLimit = room.gameType === 'capitales' ? 1 : room.config.categories.length;
+      const answerLimit = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
       if (!Array.isArray(updates) || !updates.length || updates.length > answerLimit) return ack?.({ ok: false, error: 'Réponses invalides.' });
       const seen = new Set();
       const validated = [];
@@ -793,7 +831,7 @@ function createGameServer(options = {}) {
       const linked = getPlayerRoom(socket, ack);
       if (!linked) return;
       const { room, player } = linked;
-      if (room.gameType === 'capitales') return ack?.({ ok: false, error: 'La correction du quiz est automatique.' });
+      if (room.gameType !== 'petit-bac') return ack?.({ ok: false, error: 'La correction du quiz est automatique.' });
       if (room.state !== 'correction') return ack?.({ ok: false, error: 'La correction n’est pas ouverte.' });
       const target = room.players.find((candidate) => candidate.id === payload.playerId);
       const categoryIndex = Number(payload.categoryIndex);
@@ -814,7 +852,7 @@ function createGameServer(options = {}) {
         if (!room.pendingAcceptedWords.some((entry) => entry.categoryIndex === category && normalize(entry.word) === normalize(word))) {
           room.pendingAcceptedWords.push({ word, categoryIndex: category });
         }
-        await storeAcceptedWord(word, category);
+        void storeAcceptedWord(word, category);
       }
       ackSuccess(ack, room, player);
       emitState(room);
@@ -847,6 +885,7 @@ function createGameServer(options = {}) {
       room.breakEndsAt = null;
       room.usedLetters = [];
       room.usedCountries = [];
+      room.usedQuestions = [];
       room.question = null;
       room.currentAnswers = Object.create(null);
       room.currentAnswerRevisions = Object.create(null);
@@ -924,6 +963,7 @@ function createGameServer(options = {}) {
     }),
     close: async () => {
       closing = true;
+      clearInterval(dictionaryRefreshTimer);
       for (const room of rooms.values()) clearAllTimers(room);
       const pendingCheckpointCodes = new Set([...checkpointTimers.keys(), ...checkpointWrites.keys(), ...rooms.keys()]);
       for (const timer of checkpointTimers.values()) clearTimeout(timer);
