@@ -1,0 +1,28 @@
+{
+  "name": "petit-bac-multiplayer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Petit Bac solo et multijoueur temps réel",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:render": "node server/render.js",
+    "test": "node --test",
+    "build": "node scripts/build-vercel.js",
+    "build:world-data": "node scripts/build-world-data.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
+    "express": "^4.21.2",
+    "flag-icons": "^7.5.0",
+    "ioredis": "^6.0.0",
+    "socket.io": "^4.8.1",
+    "world-countries": "^5.1.0"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}

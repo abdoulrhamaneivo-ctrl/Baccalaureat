@@ -1,6 +1,9 @@
-.env
-.env.*
+.env*
 node_modules/
+.vercel/
+public/
+.agents/
+skills-lock.json
 .DS_Store
 Thumbs.db
 *.log

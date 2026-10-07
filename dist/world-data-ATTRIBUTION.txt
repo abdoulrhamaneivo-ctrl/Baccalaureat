@@ -1,0 +1,5 @@
+Country names and capital data: mledoze/countries, distributed under the Open Database License (ODbL-1.0).
+https://github.com/mledoze/countries
+
+Flag SVG artwork: lipis/flag-icons, distributed under the MIT License; see flags/LICENSE.txt.
+https://github.com/lipis/flag-icons
