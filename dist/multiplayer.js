@@ -571,6 +571,49 @@
     { type: 'culture', name: 'Culture générale', item: 'questions' },
   ];
 
+  let homeLeaderboardCache = null;
+  let homeLeaderboardRequest = null;
+
+  function renderHomeLeaderboards(games) {
+    const target = document.getElementById('homeLeaderboardContent');
+    if (!target) return;
+    target.innerHTML = ONLINE_GAMES.map(({ type, name }) => {
+      const leaders = (games?.[type]?.leaderboard || []).slice(0, 3);
+      const rows = leaders.length
+        ? leaders.map((player, index) => `<div class="rank-row"><span class="position">${index + 1}</span><strong>${escapeHTML(player.pseudo)}</strong><span class="score">${player.score}</span><small>pts</small></div>`).join('')
+        : '<p class="online-stats-empty">Aucun score pour le moment.</p>';
+      return `<section class="card home-leaderboard-card"><div class="eyebrow">${escapeHTML(name.toUpperCase())}</div><h3>Top 3</h3>${rows}</section>`;
+    }).join('');
+  }
+
+  window.loadHomeLeaderboards = async () => {
+    const target = document.getElementById('homeLeaderboardContent');
+    if (!target) return;
+    if (homeLeaderboardCache) renderHomeLeaderboards(homeLeaderboardCache);
+    if (homeLeaderboardRequest) return homeLeaderboardRequest;
+    homeLeaderboardRequest = (async () => {
+      try {
+        await ensureConnected();
+        const response = await new Promise((resolve, reject) => {
+          socket.timeout(8000).emit('stats:get', {}, (error, result) => error ? reject(new Error('Le serveur ne répond pas.')) : resolve(result));
+        });
+        if (!response?.ok) throw new Error(response?.error || 'Impossible de charger les scores.');
+        homeLeaderboardCache = response.games;
+        renderHomeLeaderboards(homeLeaderboardCache);
+      } catch {
+        const current = document.getElementById('homeLeaderboardContent');
+        if (current && !homeLeaderboardCache) current.innerHTML = '<p class="online-stats-empty">Scores momentanément indisponibles. <button class="quiet" id="retryHomeLeaderboard">Réessayer</button></p>';
+        document.getElementById('retryHomeLeaderboard')?.addEventListener('click', () => {
+          homeLeaderboardRequest = null;
+          void window.loadHomeLeaderboards?.();
+        });
+      } finally {
+        homeLeaderboardRequest = null;
+      }
+    })();
+    return homeLeaderboardRequest;
+  };
+
   function renderOnlineStats(games) {
     const cards = ONLINE_GAMES.map(({ type, name, item }) => {
       const data = games?.[type] || { leaderboard: [], history: [] };
@@ -614,4 +657,6 @@
     if (credentials) resumeSession();
     else renderEntry();
   };
+
+  window.loadHomeLeaderboards?.();
 })();

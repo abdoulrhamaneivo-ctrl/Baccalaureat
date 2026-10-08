@@ -353,7 +353,7 @@ function createGameServer(options = {}) {
         kind: room.question.kind,
         flagCode: room.question.country.code,
         flagUrl: `/flags/${room.question.country.code}.svg`,
-        prompt: room.question.kind === 'country' ? 'Quel est le nom de ce pays ?' : 'Quelle est sa capitale ?',
+        prompt: room.question.kind === 'country' ? 'Quel est le nom de ce pays ?' : `Quelle est la capitale de ${room.question.country.name} ?`,
       };
       if (['correction', 'finished'].includes(room.state)) {
         result.question.countryName = room.question.country.name;
