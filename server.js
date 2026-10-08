@@ -24,6 +24,7 @@ const {
   WORLD_COUNTRIES,
   CAPITALS_CONTINENTS,
   CULTURE_QUESTIONS,
+  CULTURE_TRUE_FALSE_QUESTIONS,
 } = require('./server/game-rules.js');
 const { createStatsStore } = require('./server/stats-store.js');
 
@@ -368,6 +369,7 @@ function createGameServer(options = {}) {
       if (['correction', 'finished'].includes(room.state)) {
         result.question.answerIndex = room.question.answer;
         result.question.answer = room.question.options[room.question.answer];
+        result.question.explanation = room.question.explanation || '';
       }
     }
     if (room.state === 'playing' && viewer) {
@@ -483,7 +485,8 @@ function createGameServer(options = {}) {
   };
   const pickCultureQuestion = (room) => {
     const allowed = new Set(room.config.categories);
-    const pool = CULTURE_QUESTIONS.filter((question) => allowed.has(question.category));
+    const source = room.config.mode === 'vrai-faux' ? CULTURE_TRUE_FALSE_QUESTIONS : CULTURE_QUESTIONS;
+    const pool = source.filter((question) => allowed.has(question.category));
     let unused = pool.filter((question) => !room.usedQuestions.includes(question.id));
     if (!unused.length) {
       const previous = room.usedQuestions.at(-1);

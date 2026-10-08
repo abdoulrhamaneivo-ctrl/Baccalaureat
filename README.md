@@ -1,6 +1,6 @@
 # Petit Bac
 
-Deux mini-jeux en français — Petit Bac et Capitales du monde — chacun jouable en solo ou en groupe en temps réel.
+Trois jeux en français — Petit Bac, Capitales du monde et Culture générale — jouables en solo ou en groupe selon le mode.
 
 **[Jouer en ligne](https://petit-bac-ivory.vercel.app)**
 
@@ -38,6 +38,17 @@ Le quiz des drapeaux se joue seul, ou en multijoueur sur un appareil par joueur.
 - En solo comme en groupe, on peut choisir 5, 10, 15, 20 ou 30 questions, 10, 15, 20 ou 30 secondes par question, les continents et le mode de question : pays, capitale ou aléatoire.
 - Toutes les personnes d’une salle reçoivent le même drapeau, la même question et le même chronomètre. Chaque réponse correcte rapporte 10 points, même si plusieurs joueurs trouvent la réponse.
 - Les réponses sont comparées sans tenir compte des accents, des majuscules ou des séparateurs. Les pays et capitales acceptés comprennent les formes françaises et les noms alternatifs disponibles dans les données.
+
+### Culture générale
+
+Le quiz de culture générale se joue seul ou en salle multijoueur.
+
+- 90 questions à choix multiples et plus de 30 questions Vrai/Faux.
+- Thèmes : Côte d’Ivoire, histoire africaine et mondiale, géographie, sciences, arts et culture, sports et monde contemporain.
+- En solo, choisissez 5 à 30 questions et 10, 15, 20 ou 30 secondes par question. Les erreurs peuvent être rejouées à la fin de la partie.
+- En groupe, l’hôte choisit le format et les thèmes ; tous les joueurs reçoivent les mêmes questions et les mêmes choix.
+- Une explication s’affiche après chaque réponse pour aider à retenir le fait.
+- Les questions contemporaines portent sur des événements datés et des connaissances durables, pas sur un fil d’actualité en direct.
 
 ### Historique et classements
 

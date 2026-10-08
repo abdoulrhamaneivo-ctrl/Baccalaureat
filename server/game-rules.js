@@ -2,7 +2,7 @@
 
 const { CATEGORIES, normalize, assess } = require('../dist/data.js');
 const WORLD_COUNTRIES = require('../dist/world-data.js');
-const { CULTURE_CATEGORIES, CULTURE_QUESTIONS } = require('../dist/culture-data.js');
+const { CULTURE_CATEGORIES, CULTURE_QUESTIONS, CULTURE_TRUE_FALSE_QUESTIONS } = require('../dist/culture-data.js');
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const DURATIONS = [30, 60, 90, 120];
@@ -19,7 +19,7 @@ const CAPITALS_CONTINENTS = Object.freeze(['Afrique', 'Amériques', 'Asie', 'Eur
 const DEFAULT_CAPITALS_CONFIG = Object.freeze({ rounds: 10, duration: 15, questionMode: 'random', continents: [...CAPITALS_CONTINENTS], categories: [], letterMode: 'random', firstLetter: '', excludedLetters: '', pauseSeconds: 5 });
 const CAPITALS_DURATIONS = [10, 15, 20, 30];
 const CULTURE_DURATIONS = [10, 15, 20, 30];
-const DEFAULT_CULTURE_CONFIG = Object.freeze({ rounds: 10, duration: 20, categories: [...CULTURE_CATEGORIES] });
+const DEFAULT_CULTURE_CONFIG = Object.freeze({ rounds: 10, duration: 20, categories: [...CULTURE_CATEGORIES], mode: 'qcm' });
 
 function validateConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return { error: 'Configuration invalide.' };
@@ -59,10 +59,12 @@ function validateCultureConfig(input) {
   const rounds = Number(input.rounds);
   const duration = Number(input.duration);
   const categories = Array.isArray(input.categories) ? [...new Set(input.categories)] : [];
+  const mode = input.mode || 'qcm';
   if (!Number.isInteger(rounds) || rounds < 5 || rounds > 30) return { error: 'Choisissez entre 5 et 30 questions.' };
   if (!CULTURE_DURATIONS.includes(duration)) return { error: 'Durée de question invalide.' };
   if (!categories.length || categories.some((category) => !CULTURE_CATEGORIES.includes(category))) return { error: 'Choisissez au moins un thème valide.' };
-  return { value: { rounds, duration, categories } };
+  if (!['qcm', 'vrai-faux'].includes(mode)) return { error: 'Choisissez un mode de quiz valide.' };
+  return { value: { rounds, duration, categories, mode } };
 }
 
 function validatePlayerName(value) {
@@ -156,7 +158,7 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
 
 module.exports = {
   LETTERS, DURATIONS, DEFAULT_CONFIG, DEFAULT_CAPITALS_CONFIG, CAPITALS_DURATIONS, CAPITALS_CONTINENTS,
-  CULTURE_CATEGORIES, CULTURE_QUESTIONS, DEFAULT_CULTURE_CONFIG, CULTURE_DURATIONS,
+  CULTURE_CATEGORIES, CULTURE_QUESTIONS, CULTURE_TRUE_FALSE_QUESTIONS, DEFAULT_CULTURE_CONFIG, CULTURE_DURATIONS,
   WORLD_COUNTRIES, validateConfig, validateCapitalsConfig, validateCultureConfig, validatePlayerName,
   validateAnswer, normalizeQuizAnswer, isCapitalsAnswerCorrect,
   calculateRoundScores, calculateCapitalsScores, calculateCultureScores,
