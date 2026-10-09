@@ -204,6 +204,7 @@ function createGameServer(options = {}) {
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.teamMode = Boolean(room.teamMode);
           room.eliminationMode = Boolean(room.eliminationMode);
+          room.eliminationDraw = Boolean(room.eliminationDraw);
           room.eliminationNotice ||= null;
           room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
           room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; player.eliminatedAt ??= null; });
@@ -255,6 +256,7 @@ function createGameServer(options = {}) {
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.teamMode = Boolean(room.teamMode);
           room.eliminationMode = Boolean(room.eliminationMode);
+          room.eliminationDraw = Boolean(room.eliminationDraw);
           room.eliminationNotice ||= null;
           room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
           room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; player.eliminatedAt ??= null; });
@@ -346,6 +348,7 @@ function createGameServer(options = {}) {
       teamMode: false,
       teamCount: 2,
       eliminationMode: false,
+      eliminationDraw: false,
       eliminationNotice: null,
       config: gameType === 'capitales'
         ? { ...DEFAULT_CAPITALS_CONFIG, continents: [...DEFAULT_CAPITALS_CONFIG.continents] }
@@ -428,20 +431,45 @@ function createGameServer(options = {}) {
     }));
   const eliminateLastCompetitor = (room) => {
     const active = activeCompetitors(room);
+    room.eliminationDraw = false;
     room.eliminationNotice = null;
+    if (active.length === 0) {
+      room.eliminationDraw = true;
+      room.eliminationNotice = 'Tous les concurrents ont été éliminés. Le Rush se termine sans gagnant.';
+      return true;
+    }
+    if (active.length === 2 && active[0].score === active[1].score) {
+      const names = active.map((competitor) => competitor.name);
+      for (const competitor of active) {
+        const playerIds = competitor.playerIds || competitor.players.map((player) => player.id);
+        for (const player of room.players) {
+          if (playerIds.includes(player.id)) player.eliminatedAt = room.roundNumber;
+        }
+      }
+      room.eliminationDraw = true;
+      room.eliminationNotice = `Égalité à la dernière place entre ${names.join(' et ')} : les concurrents sont éliminés ensemble. Le Rush se termine sans gagnant.`;
+      return true;
+    }
     if (active.length > 2) {
       const lowestScore = Math.min(...active.map((competitor) => competitor.score));
       const last = active.filter((competitor) => competitor.score === lowestScore);
-      if (last.length === 1) {
-        const eliminated = last[0];
+      for (const eliminated of last) {
         const playerIds = eliminated.playerIds || eliminated.players.map((player) => player.id);
         for (const player of room.players) {
           if (playerIds.includes(player.id)) player.eliminatedAt = room.roundNumber;
         }
-        const remaining = activeCompetitors(room);
-        room.eliminationNotice = `${eliminated.name} est éliminé${room.teamMode ? 'e' : ''} après la manche ${room.roundNumber}. ${remaining.length} ${room.teamMode ? 'équipes' : 'joueurs'} restent en lice.`;
+      }
+      const remaining = activeCompetitors(room);
+      const eliminatedNames = last.map((competitor) => competitor.name).join(', ');
+      if (remaining.length === 0) {
+        room.eliminationDraw = true;
+        room.eliminationNotice = `Tous les concurrents étaient à égalité à la dernière place (${eliminatedNames}) et sont éliminés ensemble. Le Rush se termine sans gagnant.`;
+        return true;
+      }
+      if (last.length > 1) {
+        room.eliminationNotice = `Égalité à la dernière place : ${eliminatedNames}. Ils sont éliminés ensemble après la manche ${room.roundNumber}. ${remaining.length} ${room.teamMode ? 'équipes' : 'joueurs'} restent en lice.`;
       } else {
-        room.eliminationNotice = `Égalité à la dernière place (${last.map((competitor) => competitor.name).join(', ')}). Une nouvelle manche les départagera.`;
+        room.eliminationNotice = `${eliminatedNames} est éliminé${room.teamMode ? 'e' : ''} après la manche ${room.roundNumber}. ${remaining.length} ${room.teamMode ? 'équipes' : 'joueurs'} restent en lice.`;
       }
     }
     const remaining = activeCompetitors(room);
@@ -476,6 +504,7 @@ function createGameServer(options = {}) {
       teamCount: room.teamCount,
       teams: room.teamMode ? teamStandings(room) : [],
       eliminationMode: Boolean(room.eliminationMode),
+      eliminationDraw: Boolean(room.eliminationDraw),
       eliminationNotice: room.eliminationNotice,
       activeCompetitors: room.eliminationMode ? activeCompetitors(room).length : null,
       myEliminated: room.eliminationMode && (room.teamMode
@@ -1034,6 +1063,7 @@ function createGameServer(options = {}) {
       room.history = [];
       room.answerSequence = 0;
       room.eliminationNotice = null;
+      room.eliminationDraw = false;
       room.rankingOrder = room.players.map((player) => player.id);
       room.roundStartingRanking = [...room.rankingOrder];
       for (const player of room.players) {
@@ -1254,6 +1284,7 @@ function createGameServer(options = {}) {
       room.currentScores = null;
       room.history = [];
       room.eliminationNotice = null;
+      room.eliminationDraw = false;
       room.players.forEach((participant) => { participant.score = 0; participant.eliminatedAt = null; });
       room.rankingOrder = room.players.map((participant) => participant.id);
       room.roundStartingRanking = [...room.rankingOrder];
