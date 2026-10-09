@@ -137,6 +137,81 @@ function createStatsStore(redis = null, options = {}) {
     return true;
   }
 
+  async function updateMatch(match) {
+    if (!match || !validGameType(match.gameType) || !Array.isArray(match.players)) return false;
+    const publicMatch = cleanMatch(match);
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const existing = await client.query('SELECT players FROM game_matches WHERE match_id = $1 FOR UPDATE', [publicMatch.id]);
+        if (!existing.rowCount) { await client.query('ROLLBACK'); return false; }
+        const oldPlayers = Array.isArray(existing.rows[0].players) ? existing.rows[0].players : parseMatch(existing.rows[0].players) || [];
+        const deltas = new Map();
+        for (const player of oldPlayers) {
+          const member = pseudoKey(player.pseudo);
+          if (member) deltas.set(member, { pseudo: player.pseudo, delta: (deltas.get(member)?.delta || 0) - (Number(player.score) || 0) });
+        }
+        for (const player of publicMatch.players) {
+          const member = pseudoKey(player.pseudo);
+          if (member) deltas.set(member, { pseudo: player.pseudo, delta: (deltas.get(member)?.delta || 0) + player.score });
+        }
+        for (const [member, change] of deltas) {
+          await client.query(
+            'INSERT INTO game_leaderboard_totals (game_type, pseudo_key, pseudo, score) VALUES ($1, $2, $3, $4) ON CONFLICT (game_type, pseudo_key) DO UPDATE SET pseudo = EXCLUDED.pseudo, score = GREATEST(0, game_leaderboard_totals.score + EXCLUDED.score)',
+            [publicMatch.gameType, member, change.pseudo, change.delta],
+          );
+        }
+        await client.query('UPDATE game_matches SET completed_at = $2, rounds_played = $3, players = $4 WHERE match_id = $1', [publicMatch.id, publicMatch.completedAt, publicMatch.roundsPlayed, JSON.stringify(publicMatch.players)]);
+        await client.query('COMMIT');
+        return true;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally { client.release(); }
+    }
+    if (redis && GAME_TYPES.slice(0, 2).includes(publicMatch.gameType)) {
+      const historyKey = key('history', publicMatch.gameType);
+      const rows = await redis.lrange(historyKey, 0, -1);
+      const index = rows.findIndex((value) => parseMatch(value)?.id === publicMatch.id);
+      if (index < 0) return false;
+      const previous = parseMatch(rows[index]);
+      const transaction = redis.multi();
+      for (const player of previous.players || []) {
+        const member = pseudoKey(player.pseudo);
+        if (member) transaction.zincrby(key('ranking', publicMatch.gameType), -(Number(player.score) || 0), member);
+      }
+      for (const player of publicMatch.players) {
+        const member = pseudoKey(player.pseudo);
+        if (!member) continue;
+        transaction.zincrby(key('ranking', publicMatch.gameType), player.score, member);
+        transaction.hset(key('names', publicMatch.gameType), member, player.pseudo);
+      }
+      transaction.lset(historyKey, index, JSON.stringify(publicMatch));
+      await transaction.exec();
+      return true;
+    }
+    const list = matches.get(publicMatch.gameType);
+    const index = list.findIndex((entry) => entry.id === publicMatch.id);
+    if (index < 0) return false;
+    const previous = list[index];
+    for (const player of previous.players) {
+      const member = pseudoKey(player.pseudo);
+      if (!member) continue;
+      const board = totals.get(publicMatch.gameType);
+      board.set(member, Math.max(0, (board.get(member) || 0) - player.score));
+    }
+    for (const player of publicMatch.players) {
+      const member = pseudoKey(player.pseudo);
+      if (!member) continue;
+      const board = totals.get(publicMatch.gameType);
+      board.set(member, (board.get(member) || 0) + player.score);
+      names.get(publicMatch.gameType).set(member, player.pseudo);
+    }
+    list[index] = publicMatch;
+    return true;
+  }
+
   async function getOverview() {
     const result = {};
     for (const gameType of GAME_TYPES) {
@@ -176,7 +251,7 @@ function createStatsStore(redis = null, options = {}) {
 
   async function addApprovedWord(word, categoryIndex) {
     const normalizedWord = normalize(String(word || '').trim());
-    if (normalizedWord.length < 2 || !Number.isInteger(categoryIndex) || categoryIndex < 0 || categoryIndex > 5) return false;
+    if (normalizedWord.length < 3 || !Number.isInteger(categoryIndex) || categoryIndex < 0 || categoryIndex > 5) return false;
     const entry = { word: String(word).trim(), categoryIndex, approvedAt: currentTime() };
     if (pool) {
       await pool.query('INSERT INTO game_approved_words (category_index, normalized_word, word, approved_at) VALUES ($1, $2, $3, $4) ON CONFLICT (category_index, normalized_word) DO UPDATE SET word = EXCLUDED.word, approved_at = EXCLUDED.approved_at', [categoryIndex, normalizedWord, entry.word, entry.approvedAt]);
@@ -280,7 +355,7 @@ function createStatsStore(redis = null, options = {}) {
     } finally { client.release(); }
   }
 
-  return { initialize, recordMatch, getOverview, addApprovedWord, getApprovedWords, migrateLegacyRedis };
+  return { initialize, recordMatch, updateMatch, getOverview, addApprovedWord, getApprovedWords, migrateLegacyRedis };
 }
 
 module.exports = { GAME_TYPES, createStatsStore, pseudoKey };

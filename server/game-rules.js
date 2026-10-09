@@ -13,7 +13,7 @@ const DEFAULT_CONFIG = Object.freeze({
   letterMode: 'random',
   firstLetter: 'A',
   excludedLetters: '',
-  pauseSeconds: 10,
+  pauseSeconds: 0,
 });
 const CAPITALS_CONTINENTS = Object.freeze(['Afrique', 'Amériques', 'Asie', 'Europe', 'Océanie']);
 const DEFAULT_CAPITALS_CONFIG = Object.freeze({ rounds: 10, duration: 15, questionMode: 'random', continents: [...CAPITALS_CONTINENTS], categories: [], letterMode: 'random', firstLetter: '', excludedLetters: '', pauseSeconds: 5 });
@@ -29,15 +29,17 @@ function validateConfig(input) {
   const letterMode = input.letterMode;
   const firstLetter = String(input.firstLetter || '').trim().toUpperCase();
   const excludedLetters = String(input.excludedLetters || '').toUpperCase().replace(/[^A-Z]/g, '').split('').filter((letter, index, list) => list.indexOf(letter) === index).join('');
+  const pauseSeconds = input.pauseSeconds === undefined ? DEFAULT_CONFIG.pauseSeconds : Number(input.pauseSeconds);
   if (!Number.isInteger(rounds) || rounds < 1 || rounds > 50) return { error: 'Choisissez entre 1 et 50 manches.' };
   if (!DURATIONS.includes(duration)) return { error: 'Durée invalide.' };
+  if (![0, 5, 10, 15, 30].includes(pauseSeconds)) return { error: 'Choisissez une pause valide entre les manches.' };
   if (!categories.length || categories.some((category) => !CATEGORIES.includes(category))) return { error: 'Choisissez au moins une catégorie valide.' };
   if (!['random', 'host'].includes(letterMode)) return { error: 'Mode de choix des lettres invalide.' };
   if (!/^[A-Z]$/.test(firstLetter)) return { error: 'La première lettre doit être comprise entre A et Z.' };
   if (excludedLetters.length === LETTERS.length) return { error: 'Conservez au moins une lettre disponible.' };
   if (letterMode === 'host' && excludedLetters.includes(firstLetter)) return { error: 'La première lettre ne peut pas faire partie des lettres exclues.' };
   return {
-    value: { rounds, duration, categories, letterMode, firstLetter, excludedLetters, pauseSeconds: 10 },
+    value: { rounds, duration, categories, letterMode, firstLetter, excludedLetters, pauseSeconds },
   };
 }
 
@@ -119,7 +121,7 @@ function calculateCultureScores(players, answersByPlayer, question) {
   return result;
 }
 
-function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categories, letter) {
+function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categories, letter, answerOrderByPlayer = {}) {
   const result = Object.create(null);
   for (const player of players) result[player.id] = { total: 0, answers: [] };
 
@@ -134,6 +136,7 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
       const answer = {
         word,
         correct,
+        eligible: judged.eligible,
         duplicate: false,
         points: 0,
         reason: correct ? (approved && judged.points === 0 ? 'Validé par les joueurs' : 'Mot reconnu') : judged.reason,
@@ -142,14 +145,29 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
       if (key) eligibleAnswers.push({ playerId: player.id, key });
     }
 
-    const counts = new Map();
-    for (const entry of eligibleAnswers) counts.set(entry.key, (counts.get(entry.key) || 0) + 1);
+    const groups = new Map();
     for (const entry of eligibleAnswers) {
-      const answer = result[entry.playerId].answers[categoryIndex];
-      answer.duplicate = counts.get(entry.key) > 1;
-      answer.points = answer.duplicate ? 0 : 10;
-      answer.reason = answer.duplicate ? 'Réponse correcte en doublon · 0 point' : answer.reason;
-      result[entry.playerId].total += answer.points;
+      const group = groups.get(entry.key) || [];
+      group.push(entry);
+      groups.set(entry.key, group);
+    }
+    for (const group of groups.values()) {
+      const first = [...group].sort((left, right) => {
+        const leftOrder = Number(answerOrderByPlayer[left.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
+        const rightOrder = Number(answerOrderByPlayer[right.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
+        return leftOrder - rightOrder || players.findIndex((player) => player.id === left.playerId) - players.findIndex((player) => player.id === right.playerId);
+      })[0];
+      const duplicate = group.length > 1;
+      for (const entry of group) {
+        const answer = result[entry.playerId].answers[categoryIndex];
+        answer.duplicate = duplicate;
+        answer.wonDuplicate = duplicate && entry.playerId === first.playerId;
+        answer.points = !duplicate || answer.wonDuplicate ? 10 : 0;
+        if (duplicate) answer.reason = answer.wonDuplicate
+          ? 'Doublon · point conservé au premier à l’avoir envoyée'
+          : 'Doublon · point attribué au premier à l’avoir envoyée';
+        result[entry.playerId].total += answer.points;
+      }
     }
   });
 

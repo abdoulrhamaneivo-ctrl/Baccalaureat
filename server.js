@@ -74,10 +74,11 @@ function createGameServer(options = {}) {
   const recordFinishedGame = (room) => {
     if (room.matchId) return;
     room.matchId = crypto.randomUUID();
+    room.matchPlayers = room.players.map((player) => ({ id: player.id, name: player.name, score: player.score }));
     const match = {
       id: room.matchId,
       gameType: room.gameType,
-      completedAt: now(),
+      completedAt: room.matchCompletedAt = now(),
       roundsPlayed: room.history.length,
       players: room.players.map((player) => ({ pseudo: player.name, score: player.score })),
     };
@@ -86,9 +87,32 @@ function createGameServer(options = {}) {
     if (context) context.afterCommit.push(persist);
     else void persist();
   };
+  const updateFinishedGame = (room) => {
+    if (!room.matchId || typeof stats.updateMatch !== 'function') return;
+    const activeScores = new Map(room.players.map((player) => [player.id, player.score]));
+    const matchPlayers = room.matchPlayers || room.players.map((player) => ({ id: player.id, name: player.name, score: player.score }));
+    for (const participant of matchPlayers) {
+      if (activeScores.has(participant.id)) participant.score = activeScores.get(participant.id);
+    }
+    const match = {
+      id: room.matchId,
+      gameType: room.gameType,
+      completedAt: room.matchCompletedAt || now(),
+      roundsPlayed: room.history.length,
+      players: matchPlayers.map((player) => ({ pseudo: player.name, score: player.score })),
+    };
+    const persist = () => { void stats.updateMatch(match).catch(logTimerError); };
+    const context = transactions.getStore();
+    if (context) context.afterCommit.push(persist);
+    else persist();
+  };
 
   const roomKey = (code) => `petit-bac:room:${code}`;
   const lockKey = (code) => code === null ? 'petit-bac:lock:create' : `petit-bac:lock:${code}`;
+  const correctionReviewers = (room) => room.state === 'finished' && Array.isArray(room.matchPlayers) && room.matchPlayers.length
+    ? room.matchPlayers
+    : room.players;
+  const correctionVotesRequiredForRoom = (room) => correctionVotesRequired({ length: correctionReviewers(room).length });
   const serializedRoom = (room) => {
     const { timers: _timers, ...state } = room;
     return JSON.stringify(state);
@@ -177,10 +201,15 @@ function createGameServer(options = {}) {
         try {
           const room = typeof values[index] === 'string' ? JSON.parse(values[index]) : values[index];
           if (!room || !Array.isArray(room.players) || !['petit-bac', 'capitales', 'culture'].includes(room.gameType)) continue;
+          if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
           room.currentVotes ||= Object.create(null);
+          room.currentAnswerOrder ||= Object.create(null);
+          room.currentHints ||= Object.create(null);
+          room.answerSequence ||= 0;
+          room.rankingOrder ||= room.players.map((player) => player.id);
           room.pendingAcceptedWords ||= [];
           room.usedQuestions ||= [];
           for (const player of room.players) {
@@ -189,6 +218,7 @@ function createGameServer(options = {}) {
             room.currentAnswerRevisions[player.id] ||= Array(answerCount).fill(0);
             room.currentApprovals[player.id] ||= Array(answerCount).fill(false);
             room.currentVotes[player.id] ||= Array.from({ length: answerCount }, () => Object.create(null));
+            room.currentAnswerOrder[player.id] ||= Array(answerCount).fill(0);
             player.connected = false;
             player.socketId = null;
           }
@@ -217,16 +247,22 @@ function createGameServer(options = {}) {
         const stored = await redis.get(roomKey(code));
         if (stored) {
           const room = typeof stored === 'string' ? JSON.parse(stored) : stored;
+          if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
           room.currentVotes ||= Object.create(null);
+          room.currentAnswerOrder ||= Object.create(null);
+          room.currentHints ||= Object.create(null);
+          room.answerSequence ||= 0;
+          room.rankingOrder ||= room.players.map((player) => player.id);
           for (const player of room.players) {
             const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
             room.currentAnswers[player.id] ||= Array(answerCount).fill('');
             room.currentAnswerRevisions[player.id] ||= Array(answerCount).fill(0);
             room.currentApprovals[player.id] ||= Array(answerCount).fill(false);
             room.currentVotes[player.id] ||= Array.from({ length: answerCount }, () => Object.create(null));
+            room.currentAnswerOrder[player.id] ||= Array(answerCount).fill(0);
           }
           room.timers = { round: null, review: null, break: null, idle: null };
           rooms.set(code, room);
@@ -316,8 +352,13 @@ function createGameServer(options = {}) {
       currentAnswerRevisions: Object.create(null),
       currentApprovals: Object.create(null),
       currentVotes: Object.create(null),
+      currentAnswerOrder: Object.create(null),
+      answerSequence: 0,
+      currentHints: Object.create(null),
       currentScores: null,
       history: [],
+      rankingOrder: [host.id],
+      roundStartingRanking: [host.id],
       pendingAcceptedWords: [],
       matchId: null,
       gameStartedAt: null,
@@ -327,7 +368,13 @@ function createGameServer(options = {}) {
     rooms.set(code, room);
     return room;
   };
+  const rankedPlayers = (room, tieOrder = room.rankingOrder || room.players.map((player) => player.id)) => {
+    const previous = new Map(tieOrder.map((playerId, index) => [playerId, index]));
+    return [...room.players].sort((left, right) => right.score - left.score
+      || (previous.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (previous.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+  };
   const stateFor = (room, viewer) => {
+    const ranks = new Map(rankedPlayers(room).map((player, index) => [player.id, index + 1]));
     const result = {
       code: room.code,
       gameType: room.gameType,
@@ -337,7 +384,7 @@ function createGameServer(options = {}) {
       hostName: room.players.find((player) => player.id === room.hostId)?.name || null,
       isHost: viewer?.id === room.hostId,
       config: { ...room.config, categories: [...room.config.categories] },
-      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, connected: player.connected, isHost: player.id === room.hostId })),
+      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), connected: player.connected, isHost: player.id === room.hostId })),
       roundNumber: room.roundNumber,
       letter: room.letter,
       roundStartedAt: room.roundStartedAt,
@@ -347,7 +394,12 @@ function createGameServer(options = {}) {
       reviewSeconds: room.gameType === 'petit-bac' ? REVIEW_SECONDS : CAPITALS_REVIEW_SECONDS,
       categories: room.config.categories,
       myPlayerId: viewer?.id || null,
+      manualNextRound: room.gameType === 'petit-bac' && room.config.pauseSeconds === 0,
     };
+    if (viewer && room.gameType === 'culture') {
+      result.myHint = room.currentHints?.[viewer.id] || null;
+      result.canUseHint = room.state === 'playing' && !result.myHint && viewer.score >= 5 && !room.currentAnswers?.[viewer.id]?.[0];
+    }
     if (room.gameType === 'capitales' && room.question) {
       result.question = {
         kind: room.question.kind,
@@ -391,7 +443,7 @@ function createGameServer(options = {}) {
           const word = room.currentAnswers[player.id]?.[index] || '';
           const judged = assess(word, CATEGORIES.indexOf(category), room.letter);
           const ballots = room.currentVotes?.[player.id]?.[index] || Object.create(null);
-          const requiredVotes = correctionVotesRequired(room.players);
+          const requiredVotes = correctionVotesRequiredForRoom(room);
           return {
             category,
             ...(room.currentScores[player.id]?.answers[index] || { word, correct: false, duplicate: false, points: 0, reason: 'Réponse vide' }),
@@ -407,14 +459,42 @@ function createGameServer(options = {}) {
       }));
     }
     if (room.state === 'finished') {
-      let previousScore = null;
-      let rank = 0;
-      result.finalRanking = room.players.map((player, index) => ({ id: player.id, name: player.name, score: player.score, index })).sort((a, b) => b.score - a.score || a.index - b.index).map((player, index) => {
-        if (player.score !== previousScore) rank = index + 1;
-        previousScore = player.score;
-        return { id: player.id, name: player.name, score: player.score, rank };
-      });
+      result.finalRanking = rankedPlayers(room).map((player, index) => ({
+        id: player.id,
+        name: player.name,
+        score: player.score,
+        rank: index + 1,
+      }));
       result.roundsPlayed = room.history.length;
+      if (room.gameType === 'petit-bac') {
+        result.roundHistory = room.history.map((entry) => ({
+          number: entry.number,
+          letter: entry.letter,
+          players: room.players.map((player) => {
+            const ballotsByCategory = entry.votes?.[player.id] || [];
+            return {
+              playerId: player.id,
+              name: player.name,
+              roundScore: entry.scores?.[player.id]?.total || 0,
+              answers: room.config.categories.map((category, index) => {
+                const answer = entry.scores?.[player.id]?.answers?.[index] || { word: '', correct: false, duplicate: false, points: 0, reason: 'Réponse vide' };
+                const ballots = ballotsByCategory[index] || {};
+                const requiredVotes = correctionVotesRequiredForRoom(room);
+                const myVote = viewer?.id && Object.prototype.hasOwnProperty.call(ballots, viewer.id) ? ballots[viewer.id] : null;
+                return {
+                  category,
+                  ...answer,
+                  canReview: Boolean(entry.answers?.[player.id]) && viewer?.id !== player.id && answer.eligible && !answer.correct && !entry.approvals?.[player.id]?.[index] && myVote === null,
+                  approvalVotes: Object.values(ballots).filter((vote) => vote === true).length,
+                  rejectionVotes: Object.values(ballots).filter((vote) => vote === false).length,
+                  requiredVotes,
+                  myVote,
+                };
+              }),
+            };
+          }),
+        }));
+      }
     }
     return result;
   };
@@ -493,23 +573,26 @@ function createGameServer(options = {}) {
       room.usedQuestions = [];
       unused = pool.filter((question) => question.id !== previous);
     }
-    const choices = unused.length ? unused : pool;
+    const available = unused.length ? unused : pool;
+    const previousCategory = room.question?.category;
+    const varied = available.filter((question) => question.category !== previousCategory);
+    const choices = varied.length ? varied : available;
     const question = choices[crypto.randomInt(choices.length)];
     room.usedQuestions.push(question.id);
     return question;
   };
-  const scoreCurrentRound = (room) => room.gameType === 'capitales'
-    ? calculateCapitalsScores(room.players, room.currentAnswers, room.question)
+  const scoreCurrentRound = (room, answers = room.currentAnswers, approvals = room.currentApprovals, answerOrder = room.currentAnswerOrder) => room.gameType === 'capitales'
+    ? calculateCapitalsScores(room.players, answers, room.question)
     : room.gameType === 'culture'
-      ? calculateCultureScores(room.players, room.currentAnswers, room.question)
-      : calculateRoundScores(room.players, room.currentAnswers, room.currentApprovals, room.config.categories, room.letter);
+      ? calculateCultureScores(room.players, answers, room.question)
+      : calculateRoundScores(room.players, answers, approvals, room.config.categories, room.letter, answerOrder);
   const refreshCorrectionScores = (room) => {
     for (const player of room.players) {
       const answers = room.currentApprovals[player.id] || (room.currentApprovals[player.id] = []);
       const ballotsByCategory = room.currentVotes?.[player.id] || [];
       for (let index = 0; index < room.config.categories.length; index += 1) {
         const ballots = ballotsByCategory[index] || {};
-        const required = correctionVotesRequired(room.players);
+        const required = correctionVotesRequiredForRoom(room);
         const approvals = Object.values(ballots).filter((vote) => vote === true).length;
         const rejections = Object.values(ballots).filter((vote) => vote === false).length;
         answers[index] = approvals >= required && approvals > rejections;
@@ -521,11 +604,42 @@ function createGameServer(options = {}) {
       player.score += (nextScores[player.id]?.total || 0) - (previousScores[player.id]?.total || 0);
     }
     room.currentScores = nextScores;
-    if (room.history.length) room.history.at(-1).scores = nextScores;
+    if (room.history.length) {
+      const entry = room.history.at(-1);
+      entry.scores = nextScores;
+      entry.approvals = JSON.parse(JSON.stringify(room.currentApprovals));
+      entry.votes = JSON.parse(JSON.stringify(room.currentVotes));
+    }
+    room.rankingOrder = rankedPlayers(room, room.roundStartingRanking || room.rankingOrder).map((player) => player.id);
+  };
+  const refreshHistoricalScores = (room) => {
+    for (const entry of room.history) {
+      if (!entry.answers) continue;
+      entry.approvals ||= Object.create(null);
+      for (const player of room.players) {
+        const answers = entry.approvals[player.id] || (entry.approvals[player.id] = []);
+        const ballotsByCategory = entry.votes?.[player.id] || [];
+        for (let index = 0; index < room.config.categories.length; index += 1) {
+          const ballots = ballotsByCategory[index] || {};
+          const required = correctionVotesRequiredForRoom(room);
+          const approvals = Object.values(ballots).filter((vote) => vote === true).length;
+          const rejections = Object.values(ballots).filter((vote) => vote === false).length;
+          answers[index] = approvals >= required && approvals > rejections;
+        }
+      }
+      const previousScores = entry.scores || Object.create(null);
+      const nextScores = calculateRoundScores(room.players, entry.answers, entry.approvals, room.config.categories, entry.letter, entry.answerOrder);
+      for (const player of room.players) {
+        player.score += (nextScores[player.id]?.total || 0) - (previousScores[player.id]?.total || 0);
+      }
+      entry.scores = nextScores;
+    }
+    room.rankingOrder = rankedPlayers(room).map((player) => player.id);
   };
   const startRound = (room) => {
     clearTimer(room, 'break');
     clearTimer(room, 'round');
+    room.roundStartingRanking = rankedPlayers(room).map((player) => player.id);
     room.roundNumber += 1;
     if (room.gameType === 'capitales') {
       room.letter = null;
@@ -547,6 +661,8 @@ function createGameServer(options = {}) {
     room.currentAnswerRevisions = Object.create(null);
     room.currentApprovals = Object.create(null);
     room.currentVotes = Object.create(null);
+    room.currentAnswerOrder = Object.create(null);
+    room.currentHints = Object.create(null);
     room.currentScores = null;
     for (const player of room.players) {
       const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
@@ -554,6 +670,7 @@ function createGameServer(options = {}) {
       room.currentAnswerRevisions[player.id] = Array(answerCount).fill(0);
       room.currentApprovals[player.id] = Array(answerCount).fill(false);
       room.currentVotes[player.id] = Array.from({ length: answerCount }, () => Object.create(null));
+      room.currentAnswerOrder[player.id] = Array(answerCount).fill(0);
     }
     const roundNumber = room.roundNumber;
     room.timers.round = scheduleTimer(() => runTimer(() => endRound(room.code, roundNumber)), room.config.duration * 1000);
@@ -572,7 +689,17 @@ function createGameServer(options = {}) {
     clearTimer(room, 'review');
     room.currentScores = scoreCurrentRound(room);
     for (const player of room.players) player.score += room.currentScores[player.id]?.total || 0;
-    room.history.push({ number: room.roundNumber, letter: room.letter, scores: room.currentScores });
+    room.history.push({
+      number: room.roundNumber,
+      letter: room.letter,
+      scores: room.currentScores,
+      answers: JSON.parse(JSON.stringify(room.currentAnswers)),
+      answerOrder: JSON.parse(JSON.stringify(room.currentAnswerOrder)),
+      approvals: JSON.parse(JSON.stringify(room.currentApprovals)),
+      votes: JSON.parse(JSON.stringify(room.currentVotes)),
+      rankingBefore: [...(room.roundStartingRanking || room.rankingOrder)],
+    });
+    room.rankingOrder = rankedPlayers(room, room.roundStartingRanking || room.rankingOrder).map((player) => player.id);
     room.state = 'correction';
     const reviewSeconds = room.gameType === 'petit-bac' ? REVIEW_SECONDS : CAPITALS_REVIEW_SECONDS;
     room.correctionEndsAt = now() + reviewSeconds * 1000;
@@ -600,8 +727,15 @@ function createGameServer(options = {}) {
     }
     room.state = 'break';
     room.correctionEndsAt = null;
-    room.breakEndsAt = now() + room.config.pauseSeconds * 1000;
-    room.timers.break = scheduleTimer(() => runTimer(() => startNextRound(code, roundNumber)), room.config.pauseSeconds * 1000);
+    const manual = room.gameType === 'petit-bac' && room.config.pauseSeconds === 0;
+    const pauseSeconds = room.gameType === 'petit-bac' || room.gameType === 'capitales' ? room.config.pauseSeconds : 1;
+    if (manual) {
+      room.breakEndsAt = null;
+      clearTimer(room, 'break');
+    } else {
+      room.breakEndsAt = now() + pauseSeconds * 1000;
+      room.timers.break = scheduleTimer(() => runTimer(() => startNextRound(code, roundNumber)), pauseSeconds * 1000);
+    }
     emitState(room);
   }
 
@@ -652,7 +786,7 @@ function createGameServer(options = {}) {
       const register = socket.on.bind(socket);
       const transactionalEvents = new Set([
         'room:create', 'room:join', 'session:resume', 'game:configure', 'game:start', 'game:sync',
-        'answer:update', 'answers:update', 'correction:approve', 'correction:finish', 'game:replay',
+        'answer:update', 'answers:update', 'correction:approve', 'correction:finish', 'round:next', 'culture:hint', 'game:replay',
         'room:leave', 'disconnect',
       ]);
       socket.on = (event, listener) => {
@@ -699,6 +833,7 @@ function createGameServer(options = {}) {
       const code = String(payload.code || '').toUpperCase().replace(/\s/g, '');
       const room = rooms.get(code);
       if (!room) return ack?.({ ok: false, error: 'Cette salle est introuvable.' });
+      if (room.state === 'finished') return ack?.({ ok: false, error: 'Cette partie est terminée. Demandez à l’hôte de la relancer pour rejoindre la salle.' });
       if (room.players.length >= 20) return ack?.({ ok: false, error: 'Cette salle a atteint sa limite de 20 joueurs.' });
       const checkedName = validatePlayerName(payload.name);
       if (checkedName.error) return ack?.({ ok: false, error: checkedName.error });
@@ -710,6 +845,7 @@ function createGameServer(options = {}) {
       room.currentAnswerRevisions[player.id] = Array(answerCount).fill(0);
       room.currentApprovals[player.id] = Array(answerCount).fill(false);
       room.currentVotes[player.id] = Array.from({ length: answerCount }, () => Object.create(null));
+      room.currentAnswerOrder[player.id] = Array(answerCount).fill(0);
       clearTimer(room, 'idle');
       socket.data.roomCode = room.code;
       socket.join(room.code);
@@ -756,11 +892,16 @@ function createGameServer(options = {}) {
       if (room.players.filter((player) => player.connected).length < 2) return ack?.({ ok: false, error: 'Il faut au moins deux joueurs connectés pour démarrer.' });
       room.roundNumber = 0;
       room.matchId = null;
+      room.matchCompletedAt = null;
+      room.matchPlayers = null;
       room.gameStartedAt = now();
       room.usedLetters = [];
       room.usedCountries = [];
       room.usedQuestions = [];
       room.history = [];
+      room.answerSequence = 0;
+      room.rankingOrder = room.players.map((player) => player.id);
+      room.roundStartingRanking = [...room.rankingOrder];
       for (const player of room.players) player.score = 0;
       ack?.({ ok: true });
       startRound(room);
@@ -803,6 +944,9 @@ function createGameServer(options = {}) {
       for (const update of validated) {
         room.currentAnswers[player.id][update.categoryIndex] = update.value;
         room.currentAnswerRevisions[player.id][update.categoryIndex] = update.revision;
+        room.answerSequence = (room.answerSequence || 0) + 1;
+        room.currentAnswerOrder[player.id] ||= Array(answerLimit).fill(0);
+        room.currentAnswerOrder[player.id][update.categoryIndex] = room.answerSequence;
       }
       if (validated.length) {
         const context = transactions.getStore();
@@ -830,26 +974,89 @@ function createGameServer(options = {}) {
       ack?.({ ok: true });
     });
 
+    socket.on('round:next', (_payload, ack) => {
+      const linked = getPlayerRoom(socket, ack);
+      if (!linked) return;
+      const { room, player } = linked;
+      if (!hostOnly(socket, room, ack)) return;
+      if (room.gameType !== 'petit-bac' || room.state !== 'break' || room.config.pauseSeconds !== 0) {
+        return ack?.({ ok: false, error: 'Le lancement manuel de la manche suivante n’est pas disponible.' });
+      }
+      ack?.({ ok: true });
+      startNextRound(room.code, room.roundNumber);
+    });
+
+    socket.on('culture:hint', (payload = {}, ack) => {
+      const linked = getPlayerRoom(socket, ack);
+      if (!linked) return;
+      const { room, player } = linked;
+      if (room.gameType !== 'culture' || room.state !== 'playing' || !room.question) {
+        return ack?.({ ok: false, error: 'Les indices sont disponibles pendant une question de culture générale.' });
+      }
+      if (room.currentAnswers?.[player.id]?.[0]) return ack?.({ ok: false, error: 'Répondez avant de demander un indice.' });
+      const direction = payload.direction;
+      if (!['first', 'last'].includes(direction)) return ack?.({ ok: false, error: 'Choisissez le début ou la fin de la réponse.' });
+      if (room.currentHints?.[player.id]) return ack?.({ ok: false, error: 'Un indice a déjà été utilisé pour cette question.' });
+      if (player.score < 5) return ack?.({ ok: false, error: 'Il faut au moins 5 points pour acheter un indice.' });
+      const answer = Array.from(String(room.question.options[room.question.answer] || ''));
+      const letters = direction === 'first' ? answer.slice(0, 3).join('') : answer.slice(-3).join('');
+      room.currentHints ||= Object.create(null);
+      room.currentHints[player.id] = { direction, letters };
+      player.score -= 5;
+      ackSuccess(ack, room, player);
+      emitState(room);
+    });
+
     socket.on('correction:approve', async (payload = {}, ack) => {
       const linked = getPlayerRoom(socket, ack);
       if (!linked) return;
       const { room, player } = linked;
       if (room.gameType !== 'petit-bac') return ack?.({ ok: false, error: 'La correction du quiz est automatique.' });
-      if (room.state !== 'correction') return ack?.({ ok: false, error: 'La correction n’est pas ouverte.' });
+      if (!['correction', 'finished'].includes(room.state)) return ack?.({ ok: false, error: 'La correction n’est pas ouverte.' });
+      if (room.state === 'finished' && !correctionReviewers(room).some((participant) => participant.id === player.id)) {
+        return ack?.({ ok: false, error: 'Seuls les joueurs de cette partie peuvent vérifier les réponses.' });
+      }
       const target = room.players.find((candidate) => candidate.id === payload.playerId);
       const categoryIndex = Number(payload.categoryIndex);
       if (!target || !Number.isInteger(categoryIndex) || categoryIndex < 0 || categoryIndex >= room.config.categories.length) return ack?.({ ok: false, error: 'Réponse introuvable.' });
       if (target.id === player.id) return ack?.({ ok: false, error: 'Vous ne pouvez pas corriger votre propre réponse.' });
       if (typeof payload.approved !== 'boolean') return ack?.({ ok: false, error: 'Choisissez de valider ou de refuser cette réponse.' });
-      const word = room.currentAnswers[target.id][categoryIndex];
-      const judged = assess(word, CATEGORIES.indexOf(room.config.categories[categoryIndex]), room.letter);
-      if (!judged.eligible || judged.points > 0) return ack?.({ ok: false, error: judged.reason });
-      if (Object.prototype.hasOwnProperty.call(room.currentVotes[target.id][categoryIndex], player.id)) {
+      const historical = room.state === 'finished'
+        ? room.history.find((entry) => entry.number === Number(payload.roundNumber))
+        : null;
+      if (room.state === 'finished' && !historical) return ack?.({ ok: false, error: 'Cette manche est introuvable.' });
+      const letter = historical?.letter || room.letter;
+      const word = historical ? historical.answers?.[target.id]?.[categoryIndex] : room.currentAnswers[target.id]?.[categoryIndex];
+      const judged = assess(word || '', CATEGORIES.indexOf(room.config.categories[categoryIndex]), letter);
+      if (historical
+        ? !historical.scores?.[target.id]?.answers?.[categoryIndex]?.eligible || historical.scores[target.id].answers[categoryIndex].correct
+        : !judged.eligible || judged.points > 0) return ack?.({ ok: false, error: judged.reason });
+      if (historical?.approvals?.[target.id]?.[categoryIndex]) return ack?.({ ok: false, error: 'Cette réponse a déjà été validée par les joueurs.' });
+      let ballotsByCategory;
+      if (historical) {
+        historical.votes ||= Object.create(null);
+        ballotsByCategory = historical.votes[target.id] ||= Array.from({ length: room.config.categories.length }, () => Object.create(null));
+      } else ballotsByCategory = room.currentVotes?.[target.id];
+      const ballots = ballotsByCategory[categoryIndex] ||= Object.create(null);
+      if (Object.prototype.hasOwnProperty.call(ballots, player.id)) {
         return ack?.({ ok: false, error: 'Votre vote pour cette réponse a déjà été enregistré.' });
       }
-      room.currentVotes[target.id][categoryIndex][player.id] = payload.approved;
-      refreshCorrectionScores(room);
-      if (room.currentApprovals[target.id]?.[categoryIndex]) {
+      ballots[player.id] = payload.approved;
+      if (historical) {
+        const approvals = Object.values(ballots).filter((vote) => vote === true).length;
+        const rejections = Object.values(ballots).filter((vote) => vote === false).length;
+        const accepted = approvals >= correctionVotesRequiredForRoom(room) && approvals > rejections;
+        if (accepted) {
+          const category = CATEGORIES.indexOf(room.config.categories[categoryIndex]);
+          addAcceptedWord(word, category);
+          void storeAcceptedWord(word, category);
+        }
+        refreshHistoricalScores(room);
+        updateFinishedGame(room);
+      } else {
+        refreshCorrectionScores(room);
+      }
+      if (!historical && room.currentApprovals[target.id]?.[categoryIndex]) {
         room.pendingAcceptedWords ||= [];
         const category = CATEGORIES.indexOf(room.config.categories[categoryIndex]);
         if (!room.pendingAcceptedWords.some((entry) => entry.categoryIndex === category && normalize(entry.word) === normalize(word))) {
@@ -880,6 +1087,8 @@ function createGameServer(options = {}) {
       room.state = 'lobby';
       room.roundNumber = 0;
       room.matchId = null;
+      room.matchCompletedAt = null;
+      room.matchPlayers = null;
       room.gameStartedAt = null;
       room.letter = null;
       room.roundStartedAt = null;
@@ -894,9 +1103,14 @@ function createGameServer(options = {}) {
       room.currentAnswerRevisions = Object.create(null);
       room.currentApprovals = Object.create(null);
       room.currentVotes = Object.create(null);
+      room.currentAnswerOrder = Object.create(null);
+      room.currentHints = Object.create(null);
+      room.answerSequence = 0;
       room.currentScores = null;
       room.history = [];
       room.players.forEach((participant) => { participant.score = 0; });
+      room.rankingOrder = room.players.map((participant) => participant.id);
+      room.roundStartingRanking = [...room.rankingOrder];
       ackSuccess(ack, room, player);
       emitState(room);
     });
@@ -917,6 +1131,8 @@ function createGameServer(options = {}) {
         delete room.currentAnswerRevisions[player.id];
         delete room.currentApprovals[player.id];
         delete room.currentVotes[player.id];
+        delete room.currentAnswerOrder[player.id];
+        delete room.currentHints[player.id];
         for (const ballots of Object.values(room.currentVotes)) {
           for (const categoryVotes of ballots) delete categoryVotes[player.id];
         }
