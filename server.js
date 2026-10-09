@@ -202,6 +202,9 @@ function createGameServer(options = {}) {
           const room = typeof values[index] === 'string' ? JSON.parse(values[index]) : values[index];
           if (!room || !Array.isArray(room.players) || !['petit-bac', 'capitales', 'culture'].includes(room.gameType)) continue;
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
+          room.teamMode = Boolean(room.teamMode);
+          room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
+          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; });
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
@@ -248,6 +251,9 @@ function createGameServer(options = {}) {
         if (stored) {
           const room = typeof stored === 'string' ? JSON.parse(stored) : stored;
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
+          room.teamMode = Boolean(room.teamMode);
+          room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
+          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; });
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
@@ -333,6 +339,8 @@ function createGameServer(options = {}) {
       hostId: host.id,
       players: [host],
       state: 'lobby',
+      teamMode: false,
+      teamCount: 2,
       config: gameType === 'capitales'
         ? { ...DEFAULT_CAPITALS_CONFIG, continents: [...DEFAULT_CAPITALS_CONFIG.continents] }
         : gameType === 'culture'
@@ -373,6 +381,30 @@ function createGameServer(options = {}) {
     return [...room.players].sort((left, right) => right.score - left.score
       || (previous.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (previous.get(right.id) ?? Number.MAX_SAFE_INTEGER));
   };
+  const balanceTeams = (room) => {
+    const counts = Array(room.teamCount).fill(0);
+    for (const player of room.players) {
+      const teamId = counts.indexOf(Math.min(...counts));
+      player.teamId = teamId;
+      counts[teamId] += 1;
+    }
+  };
+  const addToSmallestTeam = (room, player) => {
+    const counts = Array(room.teamCount).fill(0);
+    for (const member of room.players) {
+      if (member.id !== player.id && Number.isInteger(member.teamId) && member.teamId >= 0 && member.teamId < room.teamCount) counts[member.teamId] += 1;
+    }
+    player.teamId = counts.indexOf(Math.min(...counts));
+  };
+  const teamStandings = (room) => Array.from({ length: room.teamCount }, (_, id) => {
+    const players = room.players.filter((player) => player.teamId === id);
+    return {
+      id,
+      name: `Équipe ${id + 1}`,
+      score: players.reduce((total, player) => total + (Number(player.score) || 0), 0),
+      players: players.map((player) => ({ id: player.id, name: player.name, connected: player.connected, left: Boolean(player.left) })),
+    };
+  }).sort((left, right) => right.score - left.score || left.id - right.id).map((team, index) => ({ ...team, rank: index + 1 }));
   const stateFor = (room, viewer) => {
     const ranks = new Map(rankedPlayers(room).map((player, index) => [player.id, index + 1]));
     const result = {
@@ -384,7 +416,10 @@ function createGameServer(options = {}) {
       hostName: room.players.find((player) => player.id === room.hostId)?.name || null,
       isHost: viewer?.id === room.hostId,
       config: { ...room.config, categories: [...room.config.categories] },
-      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), connected: player.connected, isHost: player.id === room.hostId })),
+      teamMode: Boolean(room.teamMode),
+      teamCount: room.teamCount,
+      teams: room.teamMode ? teamStandings(room) : [],
+      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), teamId: player.teamId ?? null, left: Boolean(player.left), connected: player.connected, isHost: player.id === room.hostId })),
       roundNumber: room.roundNumber,
       letter: room.letter,
       roundStartedAt: room.roundStartedAt,
@@ -786,7 +821,7 @@ function createGameServer(options = {}) {
       const register = socket.on.bind(socket);
       const transactionalEvents = new Set([
         'room:create', 'room:join', 'session:resume', 'game:configure', 'game:start', 'game:sync',
-        'answer:update', 'answers:update', 'correction:approve', 'correction:finish', 'round:next', 'culture:hint', 'game:replay',
+        'answer:update', 'answers:update', 'correction:approve', 'correction:finish', 'round:next', 'culture:hint', 'team:choose', 'game:replay',
         'room:leave', 'disconnect',
       ]);
       socket.on = (event, listener) => {
@@ -834,12 +869,14 @@ function createGameServer(options = {}) {
       const room = rooms.get(code);
       if (!room) return ack?.({ ok: false, error: 'Cette salle est introuvable.' });
       if (room.state === 'finished') return ack?.({ ok: false, error: 'Cette partie est terminée. Demandez à l’hôte de la relancer pour rejoindre la salle.' });
+      if (room.teamMode && room.state !== 'lobby') return ack?.({ ok: false, error: 'Cette partie en équipes a déjà commencé.' });
       if (room.players.length >= 20) return ack?.({ ok: false, error: 'Cette salle a atteint sa limite de 20 joueurs.' });
       const checkedName = validatePlayerName(payload.name);
       if (checkedName.error) return ack?.({ ok: false, error: checkedName.error });
       if (room.players.some((player) => normalize(player.name) === normalize(checkedName.value))) return ack?.({ ok: false, error: 'Ce pseudo est déjà utilisé dans la salle.' });
       const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id };
       room.players.push(player);
+      if (room.teamMode) addToSmallestTeam(room, player);
       const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
       room.currentAnswers[player.id] = Array(answerCount).fill('');
       room.currentAnswerRevisions[player.id] = Array(answerCount).fill(0);
@@ -862,6 +899,7 @@ function createGameServer(options = {}) {
       if (!room || !player) return ack?.({ ok: false, error: 'Impossible de retrouver cette partie. Vous pouvez en rejoindre une autre.' });
       if (player.socketId && player.socketId !== socket.id) io.in(player.socketId).disconnectSockets(true);
       player.connected = true;
+      player.left = false;
       player.socketId = socket.id;
       clearTimer(room, 'idle');
       socket.data.roomCode = room.code;
@@ -878,8 +916,28 @@ function createGameServer(options = {}) {
       if (room.state !== 'lobby') return ack?.({ ok: false, error: 'La configuration est verrouillée après le démarrage.' });
       const checked = room.gameType === 'capitales' ? validateCapitalsConfig(payload.config) : room.gameType === 'culture' ? validateCultureConfig(payload.config) : validateConfig(payload.config);
       if (checked.error) return ack?.({ ok: false, error: checked.error });
+      const teamMode = payload.teamMode === undefined ? Boolean(room.teamMode) : payload.teamMode === true;
+      const teamCount = payload.teamCount === undefined ? Number(room.teamCount) || 2 : Number(payload.teamCount);
+      if (![2, 3, 4].includes(teamCount)) return ack?.({ ok: false, error: 'Choisissez entre 2 et 4 équipes.' });
+      const teamSetupChanged = teamMode !== Boolean(room.teamMode) || teamCount !== room.teamCount;
       room.config = checked.value;
+      room.teamMode = teamMode;
+      room.teamCount = teamCount;
+      if (!teamMode) room.players.forEach((player) => { player.teamId = null; });
+      else if (teamSetupChanged || room.players.some((player) => !Number.isInteger(player.teamId) || player.teamId < 0 || player.teamId >= teamCount)) balanceTeams(room);
       ackSuccess(ack, room, linked.player);
+      emitState(room);
+    });
+
+    socket.on('team:choose', (payload = {}, ack) => {
+      const linked = getPlayerRoom(socket, ack);
+      if (!linked) return;
+      const { room, player } = linked;
+      const teamId = Number(payload.teamId);
+      if (room.state !== 'lobby' || !room.teamMode) return ack?.({ ok: false, error: 'Les équipes se choisissent dans la salle d’attente.' });
+      if (!Number.isInteger(teamId) || teamId < 0 || teamId >= room.teamCount) return ack?.({ ok: false, error: 'Cette équipe n’existe pas.' });
+      player.teamId = teamId;
+      ackSuccess(ack, room, player);
       emitState(room);
     });
 
@@ -890,6 +948,9 @@ function createGameServer(options = {}) {
       if (!hostOnly(socket, room, ack)) return;
       if (room.state !== 'lobby') return ack?.({ ok: false, error: 'Cette partie est déjà lancée.' });
       if (room.players.filter((player) => player.connected).length < 2) return ack?.({ ok: false, error: 'Il faut au moins deux joueurs connectés pour démarrer.' });
+      if (room.teamMode && teamStandings(room).some((team) => !team.players.some((member) => member.connected))) {
+        return ack?.({ ok: false, error: 'Chaque équipe doit avoir au moins un joueur connecté.' });
+      }
       room.roundNumber = 0;
       room.matchId = null;
       room.matchCompletedAt = null;
@@ -1089,6 +1150,8 @@ function createGameServer(options = {}) {
       if (!hostOnly(socket, room, ack)) return;
       if (room.state !== 'finished') return ack?.({ ok: false, error: 'La partie n’est pas terminée.' });
       room.state = 'lobby';
+      room.players = room.players.filter((participant) => !participant.left);
+      if (room.teamMode && teamStandings(room).some((team) => !team.players.length)) balanceTeams(room);
       room.roundNumber = 0;
       room.matchId = null;
       room.matchCompletedAt = null;
@@ -1123,26 +1186,39 @@ function createGameServer(options = {}) {
       const linked = getPlayerRoom(socket, ack);
       if (!linked) return;
       const { room, player } = linked;
-      room.players = room.players.filter((candidate) => candidate.id !== player.id);
-      if (!room.players.length) {
-        clearAllTimers(room);
-        rooms.delete(room.code);
-        transactions.getStore()?.persistRooms.add(room.code);
-        if (!transactions.getStore()) scheduleCheckpoint(room.code);
-      } else {
-        if (room.hostId === player.id) room.hostId = room.players.find((candidate) => candidate.connected)?.id || room.players[0].id;
-        delete room.currentAnswers[player.id];
-        delete room.currentAnswerRevisions[player.id];
-        delete room.currentApprovals[player.id];
-        delete room.currentVotes[player.id];
-        delete room.currentAnswerOrder[player.id];
-        delete room.currentHints[player.id];
-        for (const ballots of Object.values(room.currentVotes)) {
-          for (const categoryVotes of ballots) delete categoryVotes[player.id];
+      if (room.teamMode && room.state !== 'lobby') {
+        player.connected = false;
+        player.socketId = null;
+        player.left = true;
+        if (room.hostId === player.id) room.hostId = room.players.find((candidate) => candidate.connected)?.id || player.id;
+        if (!room.players.some((candidate) => candidate.connected)) {
+          clearTimer(room, 'idle');
+          room.timers.idle = scheduleTimer(() => runTimer(() => expireDisconnectedRoom(room.code)), DISCONNECTED_ROOM_TTL);
         }
-        if (room.currentScores) delete room.currentScores[player.id];
-        if (room.state === 'correction' && room.gameType === 'petit-bac') refreshCorrectionScores(room);
         emitState(room);
+      } else {
+        room.players = room.players.filter((candidate) => candidate.id !== player.id);
+        if (!room.players.length) {
+          clearAllTimers(room);
+          rooms.delete(room.code);
+          transactions.getStore()?.persistRooms.add(room.code);
+          if (!transactions.getStore()) scheduleCheckpoint(room.code);
+        } else {
+          if (room.hostId === player.id) room.hostId = room.players.find((candidate) => candidate.connected)?.id || room.players[0].id;
+          delete room.currentAnswers[player.id];
+          delete room.currentAnswerRevisions[player.id];
+          delete room.currentApprovals[player.id];
+          delete room.currentVotes[player.id];
+          delete room.currentAnswerOrder[player.id];
+          delete room.currentHints[player.id];
+          for (const ballots of Object.values(room.currentVotes)) {
+            for (const categoryVotes of ballots) delete categoryVotes[player.id];
+          }
+          if (room.currentScores) delete room.currentScores[player.id];
+          if (room.state === 'correction' && room.gameType === 'petit-bac') refreshCorrectionScores(room);
+          if (room.teamMode && room.state === 'lobby') balanceTeams(room);
+          emitState(room);
+        }
       }
       socket.leave(room.code);
       socket.data.roomCode = null;
