@@ -713,7 +713,7 @@ function createGameServer(options = {}) {
       ? calculateCapitalsScores(scoringPlayers, answers, room.question)
       : room.gameType === 'culture'
         ? calculateCultureScores(scoringPlayers, answers, room.question)
-        : calculateRoundScores(scoringPlayers, answers, approvals, room.config.categories, room.letter, answerOrder);
+        : calculateRoundScores(scoringPlayers, answers, approvals, room.config.categories, room.letter, answerOrder, { teamMode: room.teamMode });
   };
   const refreshCorrectionScores = (room) => {
     for (const player of room.players) {
@@ -757,7 +757,7 @@ function createGameServer(options = {}) {
         }
       }
       const previousScores = entry.scores || Object.create(null);
-      const nextScores = calculateRoundScores(room.players, entry.answers, entry.approvals, room.config.categories, entry.letter, entry.answerOrder);
+      const nextScores = calculateRoundScores(room.players, entry.answers, entry.approvals, room.config.categories, entry.letter, entry.answerOrder, { teamMode: room.teamMode });
       for (const player of room.players) {
         player.score += (nextScores[player.id]?.total || 0) - (previousScores[player.id]?.total || 0);
       }

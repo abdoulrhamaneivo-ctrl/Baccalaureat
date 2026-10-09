@@ -121,8 +121,9 @@ function calculateCultureScores(players, answersByPlayer, question) {
   return result;
 }
 
-function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categories, letter, answerOrderByPlayer = {}) {
+function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categories, letter, answerOrderByPlayer = {}, options = {}) {
   const result = Object.create(null);
+  const teamMode = options.teamMode === true;
   for (const player of players) result[player.id] = { total: 0, answers: [] };
 
   categories.forEach((category, categoryIndex) => {
@@ -142,7 +143,11 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
         reason: correct ? (approved && judged.points === 0 ? 'Validé par les joueurs' : 'Mot reconnu') : judged.reason,
       };
       result[player.id].answers[categoryIndex] = answer;
-      if (key) eligibleAnswers.push({ playerId: player.id, key });
+      if (key) eligibleAnswers.push({
+        playerId: player.id,
+        key,
+        teamId: Number.isInteger(player.teamId) ? player.teamId : `player:${player.id}`,
+      });
     }
 
     const groups = new Map();
@@ -152,20 +157,40 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
       groups.set(entry.key, group);
     }
     for (const group of groups.values()) {
-      const first = [...group].sort((left, right) => {
+      const orderAnswers = (entries) => [...entries].sort((left, right) => {
         const leftOrder = Number(answerOrderByPlayer[left.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
         const rightOrder = Number(answerOrderByPlayer[right.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
         return leftOrder - rightOrder || players.findIndex((player) => player.id === left.playerId) - players.findIndex((player) => player.id === right.playerId);
-      })[0];
-      const duplicate = group.length > 1;
+      });
+      const competitors = new Map();
+      for (const entry of group) {
+        const competitorId = teamMode ? entry.teamId : `player:${entry.playerId}`;
+        const entries = competitors.get(competitorId) || [];
+        entries.push(entry);
+        competitors.set(competitorId, entries);
+      }
+      const rankedCompetitors = [...competitors.entries()]
+        .map(([id, entries]) => ({ id, first: orderAnswers(entries)[0] }))
+        .sort((left, right) => {
+          const leftOrder = Number(answerOrderByPlayer[left.first.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
+          const rightOrder = Number(answerOrderByPlayer[right.first.playerId]?.[categoryIndex]) || Number.MAX_SAFE_INTEGER;
+          return leftOrder - rightOrder || players.findIndex((player) => player.id === left.first.playerId) - players.findIndex((player) => player.id === right.first.playerId);
+        });
+      const winningCompetitorId = rankedCompetitors[0]?.id;
+      const duplicate = rankedCompetitors.length > 1;
       for (const entry of group) {
         const answer = result[entry.playerId].answers[categoryIndex];
         answer.duplicate = duplicate;
-        answer.wonDuplicate = duplicate && entry.playerId === first.playerId;
+        const competitorId = teamMode ? entry.teamId : `player:${entry.playerId}`;
+        answer.wonDuplicate = duplicate && competitorId === winningCompetitorId;
         answer.points = !duplicate || answer.wonDuplicate ? 10 : 0;
         if (duplicate) answer.reason = answer.wonDuplicate
-          ? 'Doublon · +10 points : vous l’avez saisie en premier'
-          : 'Doublon · 0 point : un autre joueur l’a saisie avant vous';
+          ? teamMode
+            ? 'Doublon entre équipes · +10 points : votre équipe l’a saisie en premier'
+            : 'Doublon · +10 points : vous l’avez saisie en premier'
+          : teamMode
+            ? 'Doublon entre équipes · 0 point : une autre équipe l’a saisie avant vous'
+            : 'Doublon · 0 point : un autre joueur l’a saisie avant vous';
         result[entry.playerId].total += answer.points;
       }
     }
