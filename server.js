@@ -408,9 +408,8 @@ function createGameServer(options = {}) {
   };
   const teamStandings = (room) => Array.from({ length: room.teamCount }, (_, id) => {
     const players = room.players.filter((player) => player.teamId === id);
-    const eliminatedAt = players.length && players.every((player) => Number.isInteger(player.eliminatedAt))
-      ? Math.min(...players.map((player) => player.eliminatedAt))
-      : null;
+    const eliminationRounds = players.map((player) => player.eliminatedAt).filter(Number.isInteger);
+    const eliminatedAt = eliminationRounds.length ? Math.min(...eliminationRounds) : null;
     return {
       id,
       name: `Équipe ${id + 1}`,
@@ -421,6 +420,14 @@ function createGameServer(options = {}) {
     };
   }).sort((left, right) => (room.eliminationMode ? Number(left.eliminated) - Number(right.eliminated) : 0)
     || right.score - left.score || left.id - right.id).map((team, index) => ({ ...team, rank: index + 1 }));
+  const playerEliminationRound = (room, player) => {
+    if (!room.eliminationMode || !player) return null;
+    if (Number.isInteger(player.eliminatedAt)) return player.eliminatedAt;
+    if (!room.teamMode) return null;
+    const team = teamStandings(room).find((candidate) => candidate.id === player.teamId);
+    return team ? team.eliminatedAt : room.roundNumber;
+  };
+  const isPlayerEliminated = (room, player) => Number.isInteger(playerEliminationRound(room, player));
   const activeCompetitors = (room) => room.teamMode
     ? teamStandings(room).filter((team) => !team.eliminated)
     : room.players.filter((player) => !Number.isInteger(player.eliminatedAt)).map((player) => ({
@@ -499,10 +506,8 @@ function createGameServer(options = {}) {
       eliminationDraw: Boolean(room.eliminationDraw),
       eliminationNotice: room.eliminationNotice,
       activeCompetitors: room.eliminationMode ? activeCompetitors(room).length : null,
-      myEliminated: room.eliminationMode && (room.teamMode
-        ? Boolean(teamStandings(room).find((team) => team.id === viewer?.teamId)?.eliminated)
-        : Number.isInteger(viewer?.eliminatedAt)),
-      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), teamId: player.teamId ?? null, left: Boolean(player.left), eliminatedAt: player.eliminatedAt ?? null, connected: player.connected, isHost: player.id === room.hostId })),
+      myEliminated: isPlayerEliminated(room, viewer),
+      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), teamId: player.teamId ?? null, left: Boolean(player.left), eliminatedAt: playerEliminationRound(room, player), connected: player.connected, isHost: player.id === room.hostId })),
       roundNumber: room.roundNumber,
       letter: room.letter,
       roundStartedAt: room.roundStartedAt,
@@ -700,7 +705,7 @@ function createGameServer(options = {}) {
     return question;
   };
   const scoreCurrentRound = (room, answers = room.currentAnswers, approvals = room.currentApprovals, answerOrder = room.currentAnswerOrder) => {
-    const scoringPlayers = room.eliminationMode ? room.players.filter((player) => !Number.isInteger(player.eliminatedAt)) : room.players;
+    const scoringPlayers = room.eliminationMode ? room.players.filter((player) => !isPlayerEliminated(room, player)) : room.players;
     return room.gameType === 'capitales'
       ? calculateCapitalsScores(scoringPlayers, answers, room.question)
       : room.gameType === 'culture'
@@ -1071,7 +1076,7 @@ function createGameServer(options = {}) {
       if (!linked) return;
       const { room, player } = linked;
       if (room.state !== 'playing') return ack?.({ ok: false, error: 'Les réponses sont verrouillées.' });
-      if (room.eliminationMode && Number.isInteger(player.eliminatedAt)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
+      if (isPlayerEliminated(room, player)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
       const receivedAt = transactions.getStore()?.receivedAt ?? now();
       if (receivedAt >= room.roundEndsAt) {
         endRound(room.code, room.roundNumber);
@@ -1157,7 +1162,7 @@ function createGameServer(options = {}) {
       if (room.gameType !== 'culture' || room.state !== 'playing' || !room.question) {
         return ack?.({ ok: false, error: 'Les indices sont disponibles pendant une question de culture générale.' });
       }
-      if (room.eliminationMode && Number.isInteger(player.eliminatedAt)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
+      if (isPlayerEliminated(room, player)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
       if (room.currentAnswers?.[player.id]?.[0]) return ack?.({ ok: false, error: 'Répondez avant de demander un indice.' });
       const direction = payload.direction;
       if (!['first', 'last'].includes(direction)) return ack?.({ ok: false, error: 'Choisissez le début ou la fin de la réponse.' });

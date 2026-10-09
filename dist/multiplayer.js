@@ -158,7 +158,7 @@
       });
     };
     sync();
-    timerSync = setInterval(sync, 1000);
+    timerSync = setInterval(sync, 2000);
   }
 
   function readCredentials() {
@@ -390,6 +390,12 @@
     return `${state.players.length} joueurs${state.teamMode && team ? ` · ${escapeHTML(team.name)} ${team.score} pts` : ''}${showIndividualScore && currentPlayer ? ` · vous ${currentPlayer.score} pts` : ''}`;
   }
 
+  function isCurrentPlayerEliminated() {
+    const currentPlayer = state?.players?.find((player) => player.id === state.myPlayerId);
+    const team = state?.teams?.find((candidate) => candidate.id === currentPlayer?.teamId);
+    return Boolean(state?.myEliminated || Number.isInteger(currentPlayer?.eliminatedAt) || (state?.teamMode && team?.eliminated));
+  }
+
   function renderPlaying() {
     if (state.gameType === 'capitales') {
       const question = state.question;
@@ -464,7 +470,7 @@
     timerSync = null;
     if (!state) return renderEntry();
     if (state.state === 'lobby') app.innerHTML = renderLobby();
-    else if (state.eliminationMode && state.myEliminated && ['playing', 'correction', 'break'].includes(state.state)) app.innerHTML = renderEliminationSpectator();
+    else if (state.eliminationMode && isCurrentPlayerEliminated() && ['playing', 'correction', 'break'].includes(state.state)) app.innerHTML = renderEliminationSpectator();
     else if (state.state === 'playing') app.innerHTML = renderPlaying();
     else if (state.state === 'correction') app.innerHTML = renderCorrection();
     else if (state.state === 'break') app.innerHTML = renderBreak();
@@ -619,6 +625,7 @@
         if (leftMs <= 0) requestTimerProgress();
       }, 250);
     }
+    if (['playing', 'correction', 'break'].includes(state.state)) requestTimerProgress();
   }
 
   async function leaveToHome() {
