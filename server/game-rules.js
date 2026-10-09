@@ -164,8 +164,8 @@ function calculateRoundScores(players, answersByPlayer, approvalsByPlayer, categ
         answer.wonDuplicate = duplicate && entry.playerId === first.playerId;
         answer.points = !duplicate || answer.wonDuplicate ? 10 : 0;
         if (duplicate) answer.reason = answer.wonDuplicate
-          ? 'Doublon · point conservé au premier à l’avoir envoyée'
-          : 'Doublon · point attribué au premier à l’avoir envoyée';
+          ? 'Doublon · +10 points : vous l’avez saisie en premier'
+          : 'Doublon · 0 point : un autre joueur l’a saisie avant vous';
         result[entry.playerId].total += answer.points;
       }
     }

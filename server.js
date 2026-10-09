@@ -936,9 +936,9 @@ function createGameServer(options = {}) {
           return ack?.({ ok: false, error: 'Version de réponse invalide.' });
         }
         if (hasRevision && requestedRevision > storedRevision) {
-          validated.push({ categoryIndex, value: checked.value, revision: requestedRevision });
+          validated.push({ categoryIndex, value: checked.value, revision: requestedRevision, enteredAt: update.enteredAt });
         } else if (!hasRevision) {
-          validated.push({ categoryIndex, value: checked.value, revision: storedRevision + 1 });
+          validated.push({ categoryIndex, value: checked.value, revision: storedRevision + 1, enteredAt: update.enteredAt });
         }
       }
       for (const update of validated) {
@@ -946,7 +946,11 @@ function createGameServer(options = {}) {
         room.currentAnswerRevisions[player.id][update.categoryIndex] = update.revision;
         room.answerSequence = (room.answerSequence || 0) + 1;
         room.currentAnswerOrder[player.id] ||= Array(answerLimit).fill(0);
-        room.currentAnswerOrder[player.id][update.categoryIndex] = room.answerSequence;
+        const requestedEntryTime = Number(update.enteredAt);
+        const entryTime = Number.isFinite(requestedEntryTime)
+          ? Math.min(receivedAt, Math.max(room.roundStartedAt || 0, requestedEntryTime))
+          : receivedAt;
+        room.currentAnswerOrder[player.id][update.categoryIndex] = entryTime * 1000 + room.answerSequence;
       }
       if (validated.length) {
         const context = transactions.getStore();
