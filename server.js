@@ -203,8 +203,10 @@ function createGameServer(options = {}) {
           if (!room || !Array.isArray(room.players) || !['petit-bac', 'capitales', 'culture'].includes(room.gameType)) continue;
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.teamMode = Boolean(room.teamMode);
+          room.eliminationMode = Boolean(room.eliminationMode);
+          room.eliminationNotice ||= null;
           room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
-          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; });
+          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; player.eliminatedAt ??= null; });
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
@@ -252,8 +254,10 @@ function createGameServer(options = {}) {
           const room = typeof stored === 'string' ? JSON.parse(stored) : stored;
           if (room.gameType === 'petit-bac') room.config.pauseSeconds ??= DEFAULT_CONFIG.pauseSeconds;
           room.teamMode = Boolean(room.teamMode);
+          room.eliminationMode = Boolean(room.eliminationMode);
+          room.eliminationNotice ||= null;
           room.teamCount = [2, 3, 4].includes(Number(room.teamCount)) ? Number(room.teamCount) : 2;
-          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; });
+          room.players.forEach((player) => { player.teamId ??= null; player.left ||= false; player.eliminatedAt ??= null; });
           room.currentAnswers ||= Object.create(null);
           room.currentAnswerRevisions ||= Object.create(null);
           room.currentApprovals ||= Object.create(null);
@@ -341,6 +345,8 @@ function createGameServer(options = {}) {
       state: 'lobby',
       teamMode: false,
       teamCount: 2,
+      eliminationMode: false,
+      eliminationNotice: null,
       config: gameType === 'capitales'
         ? { ...DEFAULT_CAPITALS_CONFIG, continents: [...DEFAULT_CAPITALS_CONFIG.continents] }
         : gameType === 'culture'
@@ -378,7 +384,8 @@ function createGameServer(options = {}) {
   };
   const rankedPlayers = (room, tieOrder = room.rankingOrder || room.players.map((player) => player.id)) => {
     const previous = new Map(tieOrder.map((playerId, index) => [playerId, index]));
-    return [...room.players].sort((left, right) => right.score - left.score
+    return [...room.players].sort((left, right) => (room.eliminationMode ? Number(Number.isInteger(left.eliminatedAt)) - Number(Number.isInteger(right.eliminatedAt)) : 0)
+      || right.score - left.score
       || (previous.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (previous.get(right.id) ?? Number.MAX_SAFE_INTEGER));
   };
   const balanceTeams = (room) => {
@@ -398,13 +405,62 @@ function createGameServer(options = {}) {
   };
   const teamStandings = (room) => Array.from({ length: room.teamCount }, (_, id) => {
     const players = room.players.filter((player) => player.teamId === id);
+    const eliminatedAt = players.length && players.every((player) => Number.isInteger(player.eliminatedAt))
+      ? Math.min(...players.map((player) => player.eliminatedAt))
+      : null;
     return {
       id,
       name: `Équipe ${id + 1}`,
       score: players.reduce((total, player) => total + (Number(player.score) || 0), 0),
-      players: players.map((player) => ({ id: player.id, name: player.name, connected: player.connected, left: Boolean(player.left) })),
+      eliminatedAt,
+      eliminated: eliminatedAt !== null,
+      players: players.map((player) => ({ id: player.id, name: player.name, connected: player.connected, left: Boolean(player.left), eliminatedAt: player.eliminatedAt ?? null })),
     };
-  }).sort((left, right) => right.score - left.score || left.id - right.id).map((team, index) => ({ ...team, rank: index + 1 }));
+  }).sort((left, right) => (room.eliminationMode ? Number(left.eliminated) - Number(right.eliminated) : 0)
+    || right.score - left.score || left.id - right.id).map((team, index) => ({ ...team, rank: index + 1 }));
+  const activeCompetitors = (room) => room.teamMode
+    ? teamStandings(room).filter((team) => !team.eliminated)
+    : room.players.filter((player) => !Number.isInteger(player.eliminatedAt)).map((player) => ({
+      id: player.id,
+      name: player.name,
+      score: player.score,
+      playerIds: [player.id],
+    }));
+  const eliminateLastCompetitor = (room) => {
+    const active = activeCompetitors(room);
+    room.eliminationNotice = null;
+    if (active.length > 2) {
+      const lowestScore = Math.min(...active.map((competitor) => competitor.score));
+      const last = active.filter((competitor) => competitor.score === lowestScore);
+      if (last.length === 1) {
+        const eliminated = last[0];
+        const playerIds = eliminated.playerIds || eliminated.players.map((player) => player.id);
+        for (const player of room.players) {
+          if (playerIds.includes(player.id)) player.eliminatedAt = room.roundNumber;
+        }
+        const remaining = activeCompetitors(room);
+        room.eliminationNotice = `${eliminated.name} est éliminé${room.teamMode ? 'e' : ''} après la manche ${room.roundNumber}. ${remaining.length} ${room.teamMode ? 'équipes' : 'joueurs'} restent en lice.`;
+      } else {
+        room.eliminationNotice = `Égalité à la dernière place (${last.map((competitor) => competitor.name).join(', ')}). Une nouvelle manche les départagera.`;
+      }
+    }
+    const remaining = activeCompetitors(room);
+    if (remaining.length === 2) {
+      const [first, second] = remaining;
+      if (first.score === second.score) {
+        room.eliminationNotice = `Égalité entre ${first.name} et ${second.name} : une manche de départage commence.`;
+        return false;
+      }
+      const winner = first.score > second.score ? first : second;
+      room.eliminationNotice = `${winner.name} remporte le Rush après ${room.roundNumber} manches.`;
+      return true;
+    }
+    if (remaining.length === 1) {
+      room.eliminationNotice = `${remaining[0].name} remporte le Rush après ${room.roundNumber} manches.`;
+      return true;
+    }
+    return remaining.length < 2;
+  };
   const stateFor = (room, viewer) => {
     const ranks = new Map(rankedPlayers(room).map((player, index) => [player.id, index + 1]));
     const result = {
@@ -419,7 +475,13 @@ function createGameServer(options = {}) {
       teamMode: Boolean(room.teamMode),
       teamCount: room.teamCount,
       teams: room.teamMode ? teamStandings(room) : [],
-      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), teamId: player.teamId ?? null, left: Boolean(player.left), connected: player.connected, isHost: player.id === room.hostId })),
+      eliminationMode: Boolean(room.eliminationMode),
+      eliminationNotice: room.eliminationNotice,
+      activeCompetitors: room.eliminationMode ? activeCompetitors(room).length : null,
+      myEliminated: room.eliminationMode && (room.teamMode
+        ? Boolean(teamStandings(room).find((team) => team.id === viewer?.teamId)?.eliminated)
+        : Number.isInteger(viewer?.eliminatedAt)),
+      players: room.players.map((player) => ({ id: player.id, name: player.name, score: player.score, rank: ranks.get(player.id), teamId: player.teamId ?? null, left: Boolean(player.left), eliminatedAt: player.eliminatedAt ?? null, connected: player.connected, isHost: player.id === room.hostId })),
       roundNumber: room.roundNumber,
       letter: room.letter,
       roundStartedAt: room.roundStartedAt,
@@ -429,7 +491,7 @@ function createGameServer(options = {}) {
       reviewSeconds: room.gameType === 'petit-bac' ? REVIEW_SECONDS : CAPITALS_REVIEW_SECONDS,
       categories: room.config.categories,
       myPlayerId: viewer?.id || null,
-      manualNextRound: room.gameType === 'petit-bac' && room.config.pauseSeconds === 0,
+      manualNextRound: !room.eliminationMode && room.gameType === 'petit-bac' && room.config.pauseSeconds === 0,
     };
     if (viewer && room.gameType === 'culture') {
       result.myHint = room.currentHints?.[viewer.id] || null;
@@ -616,11 +678,14 @@ function createGameServer(options = {}) {
     room.usedQuestions.push(question.id);
     return question;
   };
-  const scoreCurrentRound = (room, answers = room.currentAnswers, approvals = room.currentApprovals, answerOrder = room.currentAnswerOrder) => room.gameType === 'capitales'
-    ? calculateCapitalsScores(room.players, answers, room.question)
-    : room.gameType === 'culture'
-      ? calculateCultureScores(room.players, answers, room.question)
-      : calculateRoundScores(room.players, answers, approvals, room.config.categories, room.letter, answerOrder);
+  const scoreCurrentRound = (room, answers = room.currentAnswers, approvals = room.currentApprovals, answerOrder = room.currentAnswerOrder) => {
+    const scoringPlayers = room.eliminationMode ? room.players.filter((player) => !Number.isInteger(player.eliminatedAt)) : room.players;
+    return room.gameType === 'capitales'
+      ? calculateCapitalsScores(scoringPlayers, answers, room.question)
+      : room.gameType === 'culture'
+        ? calculateCultureScores(scoringPlayers, answers, room.question)
+        : calculateRoundScores(scoringPlayers, answers, approvals, room.config.categories, room.letter, answerOrder);
+  };
   const refreshCorrectionScores = (room) => {
     for (const player of room.players) {
       const answers = room.currentApprovals[player.id] || (room.currentApprovals[player.id] = []);
@@ -756,14 +821,18 @@ function createGameServer(options = {}) {
     clearTimer(room, 'review');
     for (const entry of room.pendingAcceptedWords || []) addAcceptedWord(entry.word, entry.categoryIndex);
     room.pendingAcceptedWords = [];
-    if (room.roundNumber >= room.config.rounds) {
+    if (room.eliminationMode && eliminateLastCompetitor(room)) {
+      finishGame(room);
+      return;
+    }
+    if (!room.eliminationMode && room.roundNumber >= room.config.rounds) {
       finishGame(room);
       return;
     }
     room.state = 'break';
     room.correctionEndsAt = null;
-    const manual = room.gameType === 'petit-bac' && room.config.pauseSeconds === 0;
-    const pauseSeconds = room.gameType === 'petit-bac' || room.gameType === 'capitales' ? room.config.pauseSeconds : 1;
+    const manual = !room.eliminationMode && room.gameType === 'petit-bac' && room.config.pauseSeconds === 0;
+    const pauseSeconds = room.eliminationMode ? 2 : room.gameType === 'petit-bac' || room.gameType === 'capitales' ? room.config.pauseSeconds : 1;
     if (manual) {
       room.breakEndsAt = null;
       clearTimer(room, 'break');
@@ -783,7 +852,7 @@ function createGameServer(options = {}) {
 
   function reconcileRoomTime(room) {
     let changed = false;
-    const transitionLimit = room.config.rounds * 3 + 3;
+    const transitionLimit = room.eliminationMode ? 300 : room.config.rounds * 3 + 3;
     for (let attempt = 0; attempt < transitionLimit; attempt += 1) {
       const currentTime = now();
       if (room.state === 'playing' && room.roundEndsAt && currentTime >= room.roundEndsAt) {
@@ -856,7 +925,7 @@ function createGameServer(options = {}) {
       if (checkedName.error) return ack?.({ ok: false, error: checkedName.error });
       const gameType = payload.gameType || 'petit-bac';
       if (!['petit-bac', 'capitales', 'culture'].includes(gameType)) return ack?.({ ok: false, error: 'Choix du jeu invalide.' });
-      const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id, gameType };
+      const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id, gameType, eliminatedAt: null };
       const room = makeRoom(player);
       socket.data.roomCode = room.code;
       socket.join(room.code);
@@ -869,12 +938,12 @@ function createGameServer(options = {}) {
       const room = rooms.get(code);
       if (!room) return ack?.({ ok: false, error: 'Cette salle est introuvable.' });
       if (room.state === 'finished') return ack?.({ ok: false, error: 'Cette partie est terminée. Demandez à l’hôte de la relancer pour rejoindre la salle.' });
-      if (room.teamMode && room.state !== 'lobby') return ack?.({ ok: false, error: 'Cette partie en équipes a déjà commencé.' });
+      if ((room.teamMode || room.eliminationMode) && room.state !== 'lobby') return ack?.({ ok: false, error: 'Cette partie a déjà commencé.' });
       if (room.players.length >= 20) return ack?.({ ok: false, error: 'Cette salle a atteint sa limite de 20 joueurs.' });
       const checkedName = validatePlayerName(payload.name);
       if (checkedName.error) return ack?.({ ok: false, error: checkedName.error });
       if (room.players.some((player) => normalize(player.name) === normalize(checkedName.value))) return ack?.({ ok: false, error: 'Ce pseudo est déjà utilisé dans la salle.' });
-      const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id };
+      const player = { id: crypto.randomBytes(24).toString('hex'), name: checkedName.value, score: 0, connected: true, socketId: socket.id, eliminatedAt: null };
       room.players.push(player);
       if (room.teamMode) addToSmallestTeam(room, player);
       const answerCount = room.gameType === 'petit-bac' ? room.config.categories.length : 1;
@@ -917,12 +986,15 @@ function createGameServer(options = {}) {
       const checked = room.gameType === 'capitales' ? validateCapitalsConfig(payload.config) : room.gameType === 'culture' ? validateCultureConfig(payload.config) : validateConfig(payload.config);
       if (checked.error) return ack?.({ ok: false, error: checked.error });
       const teamMode = payload.teamMode === undefined ? Boolean(room.teamMode) : payload.teamMode === true;
+      const eliminationMode = payload.eliminationMode === undefined ? Boolean(room.eliminationMode) : payload.eliminationMode === true;
       const teamCount = payload.teamCount === undefined ? Number(room.teamCount) || 2 : Number(payload.teamCount);
       if (![2, 3, 4].includes(teamCount)) return ack?.({ ok: false, error: 'Choisissez entre 2 et 4 équipes.' });
       const teamSetupChanged = teamMode !== Boolean(room.teamMode) || teamCount !== room.teamCount;
       room.config = checked.value;
       room.teamMode = teamMode;
       room.teamCount = teamCount;
+      room.eliminationMode = eliminationMode;
+      room.eliminationNotice = null;
       if (!teamMode) room.players.forEach((player) => { player.teamId = null; });
       else if (teamSetupChanged || room.players.some((player) => !Number.isInteger(player.teamId) || player.teamId < 0 || player.teamId >= teamCount)) balanceTeams(room);
       ackSuccess(ack, room, linked.player);
@@ -961,9 +1033,13 @@ function createGameServer(options = {}) {
       room.usedQuestions = [];
       room.history = [];
       room.answerSequence = 0;
+      room.eliminationNotice = null;
       room.rankingOrder = room.players.map((player) => player.id);
       room.roundStartingRanking = [...room.rankingOrder];
-      for (const player of room.players) player.score = 0;
+      for (const player of room.players) {
+        player.score = 0;
+        player.eliminatedAt = null;
+      }
       ack?.({ ok: true });
       startRound(room);
     });
@@ -973,6 +1049,7 @@ function createGameServer(options = {}) {
       if (!linked) return;
       const { room, player } = linked;
       if (room.state !== 'playing') return ack?.({ ok: false, error: 'Les réponses sont verrouillées.' });
+      if (room.eliminationMode && Number.isInteger(player.eliminatedAt)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
       const receivedAt = transactions.getStore()?.receivedAt ?? now();
       if (receivedAt >= room.roundEndsAt) {
         endRound(room.code, room.roundNumber);
@@ -1058,6 +1135,7 @@ function createGameServer(options = {}) {
       if (room.gameType !== 'culture' || room.state !== 'playing' || !room.question) {
         return ack?.({ ok: false, error: 'Les indices sont disponibles pendant une question de culture générale.' });
       }
+      if (room.eliminationMode && Number.isInteger(player.eliminatedAt)) return ack?.({ ok: false, error: 'Vous avez été éliminé et suivez la suite de la partie.' });
       if (room.currentAnswers?.[player.id]?.[0]) return ack?.({ ok: false, error: 'Répondez avant de demander un indice.' });
       const direction = payload.direction;
       if (!['first', 'last'].includes(direction)) return ack?.({ ok: false, error: 'Choisissez le début ou la fin de la réponse.' });
@@ -1175,7 +1253,8 @@ function createGameServer(options = {}) {
       room.answerSequence = 0;
       room.currentScores = null;
       room.history = [];
-      room.players.forEach((participant) => { participant.score = 0; });
+      room.eliminationNotice = null;
+      room.players.forEach((participant) => { participant.score = 0; participant.eliminatedAt = null; });
       room.rankingOrder = room.players.map((participant) => participant.id);
       room.roundStartingRanking = [...room.rankingOrder];
       ackSuccess(ack, room, player);
@@ -1186,10 +1265,14 @@ function createGameServer(options = {}) {
       const linked = getPlayerRoom(socket, ack);
       if (!linked) return;
       const { room, player } = linked;
-      if (room.teamMode && room.state !== 'lobby') {
+      if ((room.teamMode || room.eliminationMode) && room.state !== 'lobby' && room.state !== 'finished') {
         player.connected = false;
         player.socketId = null;
         player.left = true;
+        if (room.eliminationMode && !room.teamMode && !Number.isInteger(player.eliminatedAt)) {
+          player.eliminatedAt = room.roundNumber;
+          room.eliminationNotice = `${player.name} a quitté le Rush et est éliminé.`;
+        }
         if (room.hostId === player.id) room.hostId = room.players.find((candidate) => candidate.connected)?.id || player.id;
         if (!room.players.some((candidate) => candidate.connected)) {
           clearTimer(room, 'idle');
