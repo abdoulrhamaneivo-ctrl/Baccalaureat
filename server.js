@@ -438,21 +438,13 @@ function createGameServer(options = {}) {
       room.eliminationNotice = 'Tous les concurrents ont été éliminés. Le Rush se termine sans gagnant.';
       return true;
     }
-    if (active.length === 2 && active[0].score === active[1].score) {
-      const names = active.map((competitor) => competitor.name);
-      for (const competitor of active) {
-        const playerIds = competitor.playerIds || competitor.players.map((player) => player.id);
-        for (const player of room.players) {
-          if (playerIds.includes(player.id)) player.eliminatedAt = room.roundNumber;
-        }
-      }
-      room.eliminationDraw = true;
-      room.eliminationNotice = `Égalité à la dernière place entre ${names.join(' et ')} : les concurrents sont éliminés ensemble. Le Rush se termine sans gagnant.`;
-      return true;
-    }
     if (active.length > 2) {
       const lowestScore = Math.min(...active.map((competitor) => competitor.score));
       const last = active.filter((competitor) => competitor.score === lowestScore);
+      if (last.length === active.length) {
+        room.eliminationNotice = `Égalité générale entre les ${room.teamMode ? 'équipes' : 'joueurs'} : une manche de départage commence.`;
+        return false;
+      }
       for (const eliminated of last) {
         const playerIds = eliminated.playerIds || eliminated.players.map((player) => player.id);
         for (const player of room.players) {
